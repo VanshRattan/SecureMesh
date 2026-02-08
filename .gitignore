@@ -1,0 +1,18 @@
+# Android
+*.iml
+.gradle
+/local.properties
+/.idea/
+.DS_Store
+/build
+/app/build
+/captures
+.externalNativeBuild
+.cxx
+
+# Keystore - never commit
+*.jks
+*.keystore
+
+# Firebase - user must add their own
+app/google-services.json

@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Capstone Chat</string>
+
+    <!-- Login -->
+    <string name="login_title">Login</string>
+    <string name="email_hint">Email</string>
+    <string name="password_hint">Password</string>
+    <string name="login_button">Login</string>
+    <string name="signup_prompt">Don\'t have an account? Sign up</string>
+
+    <!-- Signup -->
+    <string name="signup_title">Sign Up</string>
+    <string name="signup_button">Create Account</string>
+    <string name="login_prompt">Already have an account? Login</string>
+
+    <!-- Start Chat - select who to chat with -->
+    <string name="start_chat_title">Start Chat</string>
+    <string name="chat_with_hint">Enter email of person to chat with</string>
+    <string name="start_chat_button">Start Chat</string>
+    <string name="logout">Logout</string>
+
+    <!-- Chat Screen -->
+    <string name="send">Send</string>
+    <string name="message_hint">Type a message...</string>
+
+    <!-- Errors -->
+    <string name="error_empty_email">Please enter email</string>
+    <string name="error_empty_password">Please enter password</string>
+    <string name="error_empty_chat_email">Please enter the other person\'s email</string>
+    <string name="error_empty_message">Message cannot be empty</string>
+    <string name="error_auth_failed">Authentication failed</string>
+</resources>
