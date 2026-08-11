@@ -63,8 +63,10 @@ service cloud.firestore {
       allow read: if true;
       allow write: if request.auth != null && request.auth.uid == userId;
     }
-    // Chats - only participants can read/write
+    // Chats - the parent doc holds a conversation summary (participants,
+    // last message, timestamp) used by the Home conversation list.
     match /chats/{chatId} {
+      allow read, write: if request.auth != null;
       match /messages/{messageId} {
         allow read, write: if request.auth != null;
       }
@@ -82,6 +84,11 @@ When you first send a message, Firestore may show an error with a link to create
 Or manually:
 - Collection: `chats/{chatId}/messages`
 - Fields: `timestamp` (Ascending)
+
+The Home conversation list also queries the `chats` collection with
+`participants array-contains <uid>` ordered by `lastTimestamp` descending. On first
+load Firestore will log an error with a one-click link to build that composite index —
+click it once. (Manual: collection `chats`, `participants` Arrays + `lastTimestamp` Descending.)
 
 ---
 

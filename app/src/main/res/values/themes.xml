@@ -1,8 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <style name="Theme.CapstoneProject" parent="Theme.MaterialComponents.DayNight.DarkActionBar">
-        <item name="colorPrimary">@color/primary</item>
-        <item name="colorPrimaryDark">@color/primary_dark</item>
-        <item name="colorAccent">@color/accent</item>
+    <!--
+      Base Activity theme for a Compose app: no XML ActionBar (Compose draws its own
+      top bars). All real coloring/typography lives in Compose (ui/theme/*); this just
+      hosts the Compose content and keeps a neutral window background.
+    -->
+    <style name="Theme.CapstoneProject" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
     </style>
 </resources>

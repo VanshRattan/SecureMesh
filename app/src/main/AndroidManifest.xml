@@ -4,6 +4,28 @@
 
     <!-- Internet required for Firebase -->
     <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Bluetooth LE: Android 12+ (API 31+) runtime permissions -->
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="s" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" tools:targetApi="s" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" tools:targetApi="s" />
+
+    <!-- Bluetooth LE: legacy (API <= 30) permissions -->
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <!-- Location was required to scan for BLE on Android 11 and below -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+
+    <!-- Foreground service to keep the mesh alive with the screen off -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE"
+        tools:targetApi="34" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" tools:targetApi="tiramisu" />
+
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="true" />
 
     <application
         android:name=".ChatApp"
@@ -15,35 +37,23 @@
         android:theme="@style/Theme.CapstoneProject"
         tools:targetApi="31">
 
-        <!-- Login screen (Launcher Activity) -->
+        <!-- Single Compose Activity hosting the whole app -->
         <activity
-            android:name=".auth.LoginActivity"
+            android:name=".MainActivity"
             android:exported="true"
-            android:theme="@style/Theme.CapstoneProject">
+            android:theme="@style/Theme.CapstoneProject"
+            android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
 
-        <!-- Signup screen -->
-        <activity
-            android:name=".auth.SignupActivity"
+        <!-- BLE mesh foreground service -->
+        <service
+            android:name=".data.transport.ble.BleMeshService"
             android:exported="false"
-            android:theme="@style/Theme.CapstoneProject" />
-
-        <!-- Start Chat screen -->
-        <activity
-            android:name=".auth.StartChatActivity"
-            android:exported="false"
-            android:theme="@style/Theme.CapstoneProject" />
-
-        <!-- Chat screen -->
-        <activity
-            android:name=".chat.ChatActivity"
-            android:exported="false"
-            android:theme="@style/Theme.CapstoneProject"
-            android:windowSoftInputMode="adjustResize" />
+            android:foregroundServiceType="connectedDevice" />
 
     </application>
 
