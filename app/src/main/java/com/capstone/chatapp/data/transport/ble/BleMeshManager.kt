@@ -44,11 +44,16 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withTimeoutOrNull
 import java.io.ByteArrayOutputStream
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.coroutines.resume
+import kotlin.random.Random
 
 /**
  * Snapshot of what the mesh is actually doing. The individual radio flags matter on a
@@ -74,9 +79,12 @@ data class MeshStatus(
  * TTL runs out or the reach cap is hit. First arrival wins, so the shortest path is the
  * one displayed; later duplicates are dropped.
  *
- * All GATT *client* work is serialized through a single worker, because Android's stack
- * does not tolerate overlapping connects. Writes are prioritised over identity reads so
- * an SOS is never stuck behind a Nearby-list lookup.
+ * GATT *client* work runs on a bounded pool (up to [BleConstants.MAX_CONCURRENT_GATT_CONNECTIONS]
+ * connections at once — Android's stack does not tolerate unbounded overlapping connects),
+ * with a per-device lock so two workers never dial the same phone at once. Writes are
+ * prioritised over identity reads so an SOS is never stuck behind a Nearby-list lookup,
+ * and a failed connect/write is retried with exponential backoff + jitter before the
+ * neighbour is given up on.
  *
  * Every stage logs under [BleLog.TAG] — see docs/RUNTIME_TEST.md for the trace a working
  * phone-to-phone SOS produces.
@@ -96,7 +104,19 @@ class BleMeshManager(private val context: Context) {
     private var sweepJob: Job? = null
     private var advertiseRetryJob: Job? = null
     private var scanRetryJob: Job? = null
+    private var scanDutyCycleJob: Job? = null
+    private var advertiseDutyCycleJob: Job? = null
     private var btStateReceiver: BroadcastReceiver? = null
+
+    /** Caps how many GATT connections the client role runs at once (see
+     * [BleConstants.MAX_CONCURRENT_GATT_CONNECTIONS]); jobs beyond the cap simply wait
+     * their turn in [writeQueue]/[identityQueue] instead of being dropped. */
+    private val connectionSemaphore = Semaphore(BleConstants.MAX_CONCURRENT_GATT_CONNECTIONS)
+
+    /** One lock per device address so two concurrent workers never open overlapping
+     * GATT connections to the same phone. */
+    private val deviceMutexes = ConcurrentHashMap<String, Mutex>()
+    private fun deviceMutex(address: String): Mutex = deviceMutexes.getOrPut(address) { Mutex() }
 
     /**
      * Replay so a freshly-opened Emergency screen still sees SOSes that arrived while
@@ -141,15 +161,25 @@ class BleMeshManager(private val context: Context) {
     private val preparedWrites = ConcurrentHashMap<String, ByteArrayOutputStream>()
     private val outbox = ConcurrentHashMap<String, OutboxEntry>()
 
-    /** Bounded de-dup set, guarded by its own lock. */
-    private val seen = LinkedHashSet<String>()
+    /** Bounded, TTL-evicted de-dup set (msgId -> first-seen time), guarded by its own lock. */
+    private val seen = LinkedHashMap<String, Long>()
     private val seenLock = Any()
+
+    /** In-flight reassembly of a chunked message, keyed by "deviceAddress:groupId". */
+    private class ReassemblyEntry(val total: Int) {
+        val parts = arrayOfNulls<ByteArray>(total)
+        var received = 0
+        val startedAt = System.currentTimeMillis()
+    }
+    private val reassembly = ConcurrentHashMap<String, ReassemblyEntry>()
 
     private class WriteJob(val device: BluetoothDevice, val msgId: String, val bytes: ByteArray)
     private class IdentityReadJob(val device: BluetoothDevice)
 
-    private val writeQueue = Channel<WriteJob>(Channel.UNLIMITED)
-    private val identityQueue = Channel<IdentityReadJob>(Channel.UNLIMITED)
+    // Bounded so a very dense room can't grow these without limit; a full queue drops
+    // the newest job rather than blocking the caller (see trySendWrite/trySendIdentityRead).
+    private val writeQueue = Channel<WriteJob>(BleConstants.JOB_QUEUE_CAPACITY)
+    private val identityQueue = Channel<IdentityReadJob>(BleConstants.JOB_QUEUE_CAPACITY)
 
     @Volatile private var selfId: String = ""
     @Volatile private var selfName: String = ""
@@ -194,6 +224,8 @@ class BleMeshManager(private val context: Context) {
             startGattServer()
             startAdvertising()
             startScanning()
+            startScanDutyCycleLoop()
+            startAdvertiseDutyCycleLoop()
             startWorker()
             startSweeper()
             registerBluetoothStateReceiver()
@@ -262,6 +294,8 @@ class BleMeshManager(private val context: Context) {
     private fun teardownRadio() {
         advertiseRetryJob?.cancel(); advertiseRetryJob = null
         scanRetryJob?.cancel(); scanRetryJob = null
+        scanDutyCycleJob?.cancel(); scanDutyCycleJob = null
+        advertiseDutyCycleJob?.cancel(); advertiseDutyCycleJob = null
 
         if (_status.value.advertising) {
             runCatching { adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback) }
@@ -282,8 +316,10 @@ class BleMeshManager(private val context: Context) {
 
         neighbors.clear()
         identityRequested.clear()
+        identityFailures.clear()
         lastScanLog.clear()
         preparedWrites.clear()
+        reassembly.clear()
         advertiseAttempts = 0
         _status.update {
             it.copy(neighborCount = 0, advertising = false, scanning = false, serverReady = false)
@@ -344,8 +380,11 @@ class BleMeshManager(private val context: Context) {
             val address = neighbor.device.address
             if (address == excludeAddress) return@forEach
             if (!entry.delivered.add(address)) return@forEach // already sent, or in flight
-            writeQueue.trySend(WriteJob(neighbor.device, packet.msgId, bytes))
-            queued++
+            if (trySendWrite(WriteJob(neighbor.device, packet.msgId, bytes))) {
+                queued++
+            } else {
+                entry.delivered.remove(address) // let a later opportunity retry
+            }
         }
         BleLog.d(
             BleLog.Step.TX_QUEUE,
@@ -365,8 +404,11 @@ class BleMeshManager(private val context: Context) {
             if (now - entry.createdAt > BleConstants.OUTBOX_TTL_MS) return@forEach
             if (address == entry.excludeAddress) return@forEach
             if (!entry.delivered.add(address)) return@forEach
-            writeQueue.trySend(WriteJob(neighbor.device, entry.packet.msgId, entry.packet.toBytes()))
-            queued++
+            if (trySendWrite(WriteJob(neighbor.device, entry.packet.msgId, entry.packet.toBytes()))) {
+                queued++
+            } else {
+                entry.delivered.remove(address)
+            }
         }
         if (queued > 0) {
             BleLog.i(BleLog.Step.OUTBOX, "to" to BleLog.shortAddr(address), "replayed" to queued)
@@ -379,6 +421,37 @@ class BleMeshManager(private val context: Context) {
             .sortedBy { it.value.createdAt }
             .take(outbox.size - BleConstants.OUTBOX_MAX)
             .forEach { outbox.remove(it.key) }
+    }
+
+    /** Enqueues a write, dropping it politely (logged) if [writeQueue] is already full. */
+    private fun trySendWrite(job: WriteJob): Boolean {
+        val sent = writeQueue.trySend(job).isSuccess
+        if (!sent) {
+            BleLog.w(
+                BleLog.Step.QUEUE_FULL,
+                "queue" to "write",
+                "peer" to BleLog.shortAddr(job.device.address),
+                "msgId" to BleLog.shortId(job.msgId),
+            )
+        }
+        return sent
+    }
+
+    /** Enqueues an identity read, dropping it politely if [identityQueue] is full — the
+     * device stays out of [identityRequested] so a later scan result retries it. */
+    private fun trySendIdentityRead(job: IdentityReadJob): Boolean {
+        val sent = identityQueue.trySend(job).isSuccess
+        if (!sent) {
+            BleLog.w(BleLog.Step.QUEUE_FULL, "queue" to "identity", "peer" to BleLog.shortAddr(job.device.address))
+        }
+        return sent
+    }
+
+    /** Exponential backoff + jitter for the [attempt]-th retry (1-indexed). */
+    private fun retryBackoffMs(attempt: Int): Long {
+        val exp = BleConstants.RETRY_BASE_BACKOFF_MS * (1L shl (attempt - 1).coerceAtMost(6))
+        val capped = exp.coerceAtMost(BleConstants.RETRY_MAX_BACKOFF_MS)
+        return capped + Random.nextLong(0, BleConstants.RETRY_JITTER_MS + 1)
     }
 
     // ---- GATT server (peripheral / inbound) ----
@@ -508,14 +581,54 @@ class BleMeshManager(private val context: Context) {
             if (responseNeeded) {
                 gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, offset, null)
             }
-            acceptBytes(value, device.address)
+            handleChunkWrite(value, device.address)
         }
 
         override fun onExecuteWrite(device: BluetoothDevice, requestId: Int, execute: Boolean) {
             val buffer = preparedWrites.remove(device.address)
             gattServer?.sendResponse(device, requestId, BluetoothGatt.GATT_SUCCESS, 0, null)
             if (!execute || buffer == null) return
-            acceptBytes(buffer.toByteArray(), device.address)
+            handleChunkWrite(buffer.toByteArray(), device.address)
+        }
+    }
+
+    /**
+     * Parses one [BleChunk] envelope and, once every chunk in its group has arrived,
+     * reassembles and hands the full packet bytes to [acceptBytes]. A message that fit in
+     * a single chunk (the common case) is delivered immediately.
+     */
+    private fun handleChunkWrite(value: ByteArray, address: String?) {
+        if (address == null) return
+        val chunk = BleChunk.parse(value)
+        if (chunk == null) {
+            BleLog.w(BleLog.Step.RX_BAD, "peer" to BleLog.shortAddr(address), "bytes" to value.size, "reason" to "bad chunk")
+            return
+        }
+        if (chunk.total == 1) {
+            acceptBytes(chunk.payload, address)
+            return
+        }
+        val key = "$address:${chunk.groupId}"
+        val entry = reassembly.getOrPut(key) { ReassemblyEntry(chunk.total) }
+        val complete = synchronized(entry) {
+            if (chunk.seq in entry.parts.indices && entry.parts[chunk.seq] == null) {
+                entry.parts[chunk.seq] = chunk.payload
+                entry.received++
+            }
+            entry.received >= entry.total
+        }
+        BleLog.d(
+            BleLog.Step.RX_PACKET,
+            "peer" to BleLog.shortAddr(address),
+            "chunk" to "${chunk.seq + 1}/${chunk.total}",
+            "groupId" to chunk.groupId,
+        )
+        if (complete) {
+            reassembly.remove(key)
+            val combined = ByteArrayOutputStream().apply {
+                entry.parts.forEach { part -> part?.let { write(it) } }
+            }.toByteArray()
+            acceptBytes(combined, address)
         }
     }
 
@@ -568,14 +681,22 @@ class BleMeshManager(private val context: Context) {
             )
             else -> {
                 val relayed = packet.relayed()
+                // A randomized delay before re-broadcasting: every phone in radio range
+                // just received the same packet and would otherwise all hit the same
+                // neighbours' GATT servers in the same instant.
+                val jitter = Random.nextLong(0, BleConstants.REBROADCAST_JITTER_MAX_MS + 1)
                 BleLog.i(
                     BleLog.Step.RELAY_SEND,
                     "msgId" to BleLog.shortId(relayed.msgId),
                     "ttl" to "${packet.ttl}->${relayed.ttl}",
                     "hops" to "${packet.hopCount}->${relayed.hopCount}",
                     "exclude" to BleLog.shortAddr(fromAddress),
+                    "jitterMs" to jitter,
                 )
-                enqueueToNeighbors(relayed, excludeAddress = fromAddress)
+                scope.launch {
+                    delay(jitter)
+                    enqueueToNeighbors(relayed, excludeAddress = fromAddress)
+                }
             }
         }
     }
@@ -727,6 +848,49 @@ class BleMeshManager(private val context: Context) {
         }
     }
 
+    /**
+     * Alternates the scanner between ON and OFF windows so it doesn't run
+     * SCAN_MODE_LOW_LATENCY continuously. Off by [BleConstants.SCAN_DUTY_CYCLE_ENABLED],
+     * windows sized by [BleConstants.SCAN_WINDOW_ON_MS]/[BleConstants.SCAN_WINDOW_OFF_MS].
+     */
+    private fun startScanDutyCycleLoop() {
+        if (!BleConstants.SCAN_DUTY_CYCLE_ENABLED) return
+        scanDutyCycleJob?.cancel()
+        scanDutyCycleJob = scope.launch {
+            while (isActive) {
+                delay(BleConstants.SCAN_WINDOW_ON_MS)
+                if (!isActive || !_status.value.running) break
+                BleLog.d(BleLog.Step.DUTY_CYCLE, "radio" to "scan", "window" to "OFF")
+                runCatching { adapter?.bluetoothLeScanner?.stopScan(scanCallback) }
+                _status.update { it.copy(scanning = false) }
+                delay(BleConstants.SCAN_WINDOW_OFF_MS)
+                if (!isActive || !_status.value.running || !isBluetoothOn()) break
+                BleLog.d(BleLog.Step.DUTY_CYCLE, "radio" to "scan", "window" to "ON")
+                startScanning()
+            }
+        }
+    }
+
+    /** Same idea as [startScanDutyCycleLoop] but for advertising; off by default since an
+     * OFF window makes this phone briefly undiscoverable (see [BleConstants.ADVERTISE_DUTY_CYCLE_ENABLED]). */
+    private fun startAdvertiseDutyCycleLoop() {
+        if (!BleConstants.ADVERTISE_DUTY_CYCLE_ENABLED) return
+        advertiseDutyCycleJob?.cancel()
+        advertiseDutyCycleJob = scope.launch {
+            while (isActive) {
+                delay(BleConstants.ADVERTISE_WINDOW_ON_MS)
+                if (!isActive || !_status.value.running) break
+                BleLog.d(BleLog.Step.DUTY_CYCLE, "radio" to "advertise", "window" to "OFF")
+                runCatching { adapter?.bluetoothLeAdvertiser?.stopAdvertising(advertiseCallback) }
+                _status.update { it.copy(advertising = false) }
+                delay(BleConstants.ADVERTISE_WINDOW_OFF_MS)
+                if (!isActive || !_status.value.running || !isBluetoothOn()) break
+                BleLog.d(BleLog.Step.DUTY_CYCLE, "radio" to "advertise", "window" to "ON")
+                startAdvertising()
+            }
+        }
+    }
+
     private fun onDeviceSeen(device: BluetoothDevice, rssi: Int) {
         val now = System.currentTimeMillis()
         val address = device.address ?: return
@@ -759,34 +923,53 @@ class BleMeshManager(private val context: Context) {
         // Read identity once per device; the sweeper makes failures eligible for a retry.
         if (identityRequested.putIfAbsent(address, now) == null) {
             BleLog.i(BleLog.Step.IDENTITY_REQ, "peer" to BleLog.shortAddr(address))
-            identityQueue.trySend(IdentityReadJob(device))
+            if (!trySendIdentityRead(IdentityReadJob(device))) {
+                identityRequested.remove(address) // let the next scan result retry
+            }
         }
     }
 
-    // ---- Serialized GATT client worker ----
+    // ---- GATT client worker pool (bounded concurrency) ----
 
+    /** Failed identity reads, counted separately from [Neighbor.failures] (write failures)
+     * so a flaky identity read can't get a perfectly-writable neighbour dropped. */
+    private val identityFailures = ConcurrentHashMap<String, Int>()
+
+    /**
+     * Dispatches queued jobs onto a bounded pool of concurrent GATT connections (see
+     * [connectionSemaphore], sized by [BleConstants.MAX_CONCURRENT_GATT_CONNECTIONS]).
+     * Writes still win over identity reads — checked first every loop iteration — so an
+     * SOS is never stuck behind a Nearby-list lookup; what changed from the old
+     * fully-serial worker is that up to N distinct devices can now be mid-connection at
+     * once instead of one at a time, while [deviceMutex] still stops two workers from
+     * opening overlapping connections to the *same* device.
+     */
     private fun startWorker() {
         workerJob?.cancel()
         workerJob = scope.launch {
             try {
                 while (isActive) {
-                    // Writes win over identity reads: an SOS must never queue behind a
-                    // Nearby-list lookup, which can burn a full GATT timeout.
                     val write = writeQueue.tryReceive().getOrNull()
-                    if (write != null) { runWrite(write); continue }
+                    if (write != null) { dispatch { runWrite(write) }; continue }
 
                     val read = identityQueue.tryReceive().getOrNull()
-                    if (read != null) { runIdentityRead(read); continue }
+                    if (read != null) { dispatch { runIdentityRead(read) }; continue }
 
                     select {
-                        writeQueue.onReceive { runWrite(it) }
-                        identityQueue.onReceive { runIdentityRead(it) }
+                        writeQueue.onReceive { dispatch { runWrite(it) } }
+                        identityQueue.onReceive { dispatch { runIdentityRead(it) } }
                     }
                 }
             } catch (_: ClosedReceiveChannelException) {
                 // shutdown() closed the queues.
             }
         }
+    }
+
+    /** Runs [block] on its own coroutine gated by [connectionSemaphore], so at most
+     * [BleConstants.MAX_CONCURRENT_GATT_CONNECTIONS] client connections are ever open. */
+    private fun dispatch(block: suspend () -> Unit) {
+        scope.launch { connectionSemaphore.withPermit { block() } }
     }
 
     private suspend fun runWrite(job: WriteJob) {
@@ -800,6 +983,10 @@ class BleMeshManager(private val context: Context) {
             outbox[job.msgId]?.delivered?.remove(job.device.address)
             if (neighbor.failures >= BleConstants.NEIGHBOR_FAILURE_LIMIT) {
                 dropNeighbor(job.device.address, "write failures")
+            } else {
+                // Reconnect/retry: back off (exponential + jitter) instead of hammering a
+                // neighbour that's momentarily out of range or mid-connection elsewhere.
+                scheduleRetry(neighbor.failures) { trySendWrite(job) }
             }
         }
         // The stack needs a breath between connects; back-to-back ones yield status 133.
@@ -807,13 +994,38 @@ class BleMeshManager(private val context: Context) {
     }
 
     private suspend fun runIdentityRead(job: IdentityReadJob) {
-        readIdentity(job.device)
+        val address = job.device.address
+        val ok = readIdentity(job.device)
+        if (ok) {
+            identityFailures.remove(address)
+        } else {
+            val attempts = identityFailures.merge(address, 1, Int::plus) ?: 1
+            if (attempts < BleConstants.NEIGHBOR_FAILURE_LIMIT) {
+                scheduleRetry(attempts) { trySendIdentityRead(job) }
+            } else {
+                identityFailures.remove(address)
+                identityRequested.remove(address) // eligible again on the next scan result
+            }
+        }
         delay(200)
+    }
+
+    /** Schedules [enqueue] after an exponential-backoff-plus-jitter delay (see
+     * [retryBackoffMs]) instead of retrying inline, so a flaky neighbour can't tie up a
+     * worker slot spinning. */
+    private fun scheduleRetry(attempt: Int, enqueue: () -> Boolean) {
+        val delayMs = retryBackoffMs(attempt)
+        BleLog.i(BleLog.Step.RETRY_SCHEDULE, "attempt" to attempt, "inMs" to delayMs)
+        scope.launch {
+            delay(delayMs)
+            enqueue()
+        }
     }
 
     private fun dropNeighbor(address: String, reason: String) {
         if (neighbors.remove(address) != null) {
             identityRequested.remove(address)
+            identityFailures.remove(address)
             lastScanLog.remove(address)
             _status.update { it.copy(neighborCount = neighbors.size) }
             BleLog.i(
@@ -827,9 +1039,11 @@ class BleMeshManager(private val context: Context) {
 
     /**
      * Connect to [device] and read its identity characteristic ("uid|name"), adding it to
-     * the Nearby list. Runs on the serialized worker so it never overlaps a write.
+     * the Nearby list. [deviceMutex] guarantees this never overlaps a write (or another
+     * identity read) to the same device, even though multiple *other* devices may now be
+     * connecting concurrently. Returns false on a failure worth retrying.
      */
-    private suspend fun readIdentity(device: BluetoothDevice) {
+    private suspend fun readIdentity(device: BluetoothDevice): Boolean = deviceMutex(device.address).withLock {
         val identity = withTimeoutOrNull(BleConstants.GATT_OP_TIMEOUT_MS) {
             suspendCancellableCoroutine { cont ->
                 var settled = false
@@ -912,20 +1126,18 @@ class BleMeshManager(private val context: Context) {
 
         if (identity == null) {
             BleLog.w(BleLog.Step.IDENTITY_FAIL, "peer" to BleLog.shortAddr(device.address), "reason" to "no value")
-            // Let a future scan retry this device.
-            identityRequested.remove(device.address)
-            return
+            return@withLock false
         }
         val parts = identity.split("|", limit = 2)
         val uid = parts.getOrNull(0)?.takeIf { it.isNotBlank() }
         if (uid == null) {
             BleLog.w(BleLog.Step.IDENTITY_FAIL, "peer" to BleLog.shortAddr(device.address), "reason" to "blank uid")
-            return
+            return@withLock false
         }
         val name = parts.getOrNull(1)?.takeIf { it.isNotBlank() } ?: "Someone"
         if (uid == selfId) {
             BleLog.d(BleLog.Step.IDENTITY_OK, "peer" to BleLog.shortAddr(device.address), "self" to true)
-            return
+            return@withLock true
         }
         BleLog.i(
             BleLog.Step.IDENTITY_OK,
@@ -935,24 +1147,48 @@ class BleMeshManager(private val context: Context) {
         )
         nearby[uid] = NearbyPeer(uid, name, device.address, System.currentTimeMillis())
         publishNearby()
+        true
     }
 
     private fun publishNearby() {
         _nearbyPeers.value = nearby.values.sortedBy { it.name.lowercase() }
     }
 
-    private suspend fun sendToDevice(device: BluetoothDevice, msgId: String, bytes: ByteArray): Boolean {
+    /**
+     * Connects to [device] and writes [bytes] as one or more [BleChunk] envelopes (see
+     * [BleChunk] for why — the negotiated MTU may be far smaller than the payload).
+     * [deviceMutex] guarantees this never overlaps another connection to the same device.
+     */
+    private suspend fun sendToDevice(device: BluetoothDevice, msgId: String, bytes: ByteArray): Boolean =
+        deviceMutex(device.address).withLock {
         val peer = BleLog.shortAddr(device.address)
+        val groupId = Random.nextInt()
         BleLog.i(BleLog.Step.TX_CONNECT, "peer" to peer, "msgId" to BleLog.shortId(msgId), "bytes" to bytes.size)
 
         val ok = withTimeoutOrNull(BleConstants.GATT_OP_TIMEOUT_MS) {
             suspendCancellableCoroutine { cont ->
                 var settled = false
+                var chunks: List<ByteArray> = emptyList()
+                var chunkIndex = 0
                 fun finish(result: Boolean, gatt: BluetoothGatt?) {
                     if (settled) return
                     settled = true
                     runCatching { gatt?.disconnect(); gatt?.close() }
                     if (cont.isActive) cont.resume(result)
+                }
+                fun buildChunks(mtu: Int): List<ByteArray> {
+                    val payloadSize = (mtu - 3 - BleConstants.CHUNK_HEADER_SIZE)
+                        .coerceAtLeast(BleConstants.CHUNK_MIN_PAYLOAD)
+                    return BleChunk.split(bytes, payloadSize, groupId)
+                }
+                fun sendChunk(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic): Boolean {
+                    BleLog.d(
+                        BleLog.Step.TX_WRITE,
+                        "peer" to peer,
+                        "msgId" to BleLog.shortId(msgId),
+                        "chunk" to "${chunkIndex + 1}/${chunks.size}",
+                    )
+                    return writeToCharacteristic(gatt, characteristic, chunks[chunkIndex])
                 }
                 val callback = object : BluetoothGattCallback() {
                     override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
@@ -969,21 +1205,28 @@ class BleMeshManager(private val context: Context) {
                         }
                         when (newState) {
                             // If the MTU request is rejected outright, fall straight
-                            // through to discovery instead of waiting for the timeout.
+                            // through to discovery (with the default 23-byte ATT MTU)
+                            // instead of waiting for the timeout.
                             BluetoothProfile.STATE_CONNECTED ->
-                                if (!gatt.requestMtu(BleConstants.REQUESTED_MTU)) gatt.discoverServices()
+                                if (!gatt.requestMtu(BleConstants.REQUESTED_MTU)) {
+                                    chunks = buildChunks(23)
+                                    gatt.discoverServices()
+                                }
                             BluetoothProfile.STATE_DISCONNECTED -> finish(false, gatt)
                         }
                     }
 
                     override fun onMtuChanged(gatt: BluetoothGatt, mtu: Int, status: Int) {
+                        val negotiated = if (status == BluetoothGatt.GATT_SUCCESS) mtu else 23
+                        chunks = buildChunks(negotiated)
                         BleLog.d(
                             BleLog.Step.TX_MTU,
                             "side" to "client",
                             "peer" to peer,
-                            "mtu" to mtu,
+                            "mtu" to negotiated,
                             "status" to BleLog.gattStatus(status),
                             "payload" to bytes.size,
+                            "chunks" to chunks.size,
                         )
                         if (!gatt.discoverServices()) finish(false, gatt)
                     }
@@ -1011,8 +1254,9 @@ class BleMeshManager(private val context: Context) {
                             finish(false, gatt)
                             return
                         }
-                        BleLog.d(BleLog.Step.TX_WRITE, "peer" to peer, "msgId" to BleLog.shortId(msgId))
-                        if (!writeToCharacteristic(gatt, characteristic, bytes)) {
+                        chunkIndex = 0
+                        if (chunks.isEmpty()) chunks = buildChunks(23) // onMtuChanged never fired
+                        if (!sendChunk(gatt, characteristic)) {
                             BleLog.w(BleLog.Step.TX_FAIL, "peer" to peer, "stage" to "write", "reason" to "rejected")
                             finish(false, gatt)
                         }
@@ -1023,19 +1267,39 @@ class BleMeshManager(private val context: Context) {
                         characteristic: BluetoothGattCharacteristic,
                         status: Int,
                     ) {
-                        val success = status == BluetoothGatt.GATT_SUCCESS
-                        if (success) {
-                            BleLog.i(BleLog.Step.TX_OK, "peer" to peer, "msgId" to BleLog.shortId(msgId))
-                        } else {
+                        if (status != BluetoothGatt.GATT_SUCCESS) {
                             BleLog.w(
                                 BleLog.Step.TX_FAIL,
                                 "peer" to peer,
                                 "msgId" to BleLog.shortId(msgId),
                                 "stage" to "write",
+                                "chunk" to "${chunkIndex + 1}/${chunks.size}",
                                 "status" to BleLog.gattStatus(status),
                             )
+                            finish(false, gatt)
+                            return
                         }
-                        finish(success, gatt)
+                        chunkIndex++
+                        if (chunkIndex >= chunks.size) {
+                            BleLog.i(
+                                BleLog.Step.TX_OK,
+                                "peer" to peer,
+                                "msgId" to BleLog.shortId(msgId),
+                                "chunks" to chunks.size,
+                            )
+                            finish(true, gatt)
+                            return
+                        }
+                        if (!sendChunk(gatt, characteristic)) {
+                            BleLog.w(
+                                BleLog.Step.TX_FAIL,
+                                "peer" to peer,
+                                "stage" to "write",
+                                "reason" to "rejected",
+                                "chunk" to "${chunkIndex + 1}/${chunks.size}",
+                            )
+                            finish(false, gatt)
+                        }
                     }
                 }
                 val gatt = device.connectGatt(context, false, callback, BluetoothDevice.TRANSPORT_LE)
@@ -1057,7 +1321,7 @@ class BleMeshManager(private val context: Context) {
                 "afterMs" to BleConstants.GATT_OP_TIMEOUT_MS,
             )
         }
-        return ok ?: false
+        ok ?: false
     }
 
     /** Returns false when the platform rejects the write outright, so we skip the wait. */
@@ -1097,6 +1361,8 @@ class BleMeshManager(private val context: Context) {
                         startGattServer()
                         startAdvertising()
                         startScanning()
+                        startScanDutyCycleLoop()
+                        startAdvertiseDutyCycleLoop()
                     }
                     BluetoothAdapter.STATE_TURNING_OFF, BluetoothAdapter.STATE_OFF -> synchronized(lifecycleLock) {
                         BleLog.w(BleLog.Step.BT_STATE, "state" to "OFF", "action" to "radio down")
@@ -1151,16 +1417,39 @@ class BleMeshManager(private val context: Context) {
                 identityRequested.entries
                     .filter { now - it.value > BleConstants.PEER_STALE_MS }
                     .forEach { identityRequested.remove(it.key) }
+
+                // A multi-chunk message whose sender vanished (or dropped a chunk)
+                // mid-transfer would otherwise sit in memory forever.
+                reassembly.entries
+                    .filter { now - it.value.startedAt > BleConstants.REASSEMBLY_TTL_MS }
+                    .forEach { (key, entry) ->
+                        reassembly.remove(key)
+                        BleLog.w(
+                            BleLog.Step.REASSEMBLY_DROP,
+                            "key" to key,
+                            "received" to entry.received,
+                            "total" to entry.total,
+                        )
+                    }
+
+                evictExpiredSeen(now)
             }
         }
     }
 
     private fun addSeen(msgId: String): Boolean = synchronized(seenLock) {
-        val added = seen.add(msgId)
-        if (added && seen.size > BleConstants.SEEN_MAX) {
-            val iter = seen.iterator()
-            repeat(BleConstants.SEEN_MAX / 5) { if (iter.hasNext()) { iter.next(); iter.remove() } }
+        if (seen.containsKey(msgId)) return@synchronized false
+        seen[msgId] = System.currentTimeMillis()
+        if (seen.size > BleConstants.SEEN_MAX) {
+            val iter = seen.entries.iterator()
+            repeat(seen.size - BleConstants.SEEN_MAX) { if (iter.hasNext()) { iter.next(); iter.remove() } }
         }
-        added
+        true
+    }
+
+    /** Evicts seen-set entries older than [BleConstants.SEEN_TTL_MS], independent of the
+     * size-based trim in [addSeen] — a quiet mesh should still free old ids over time. */
+    private fun evictExpiredSeen(now: Long) = synchronized(seenLock) {
+        seen.entries.removeAll { now - it.value > BleConstants.SEEN_TTL_MS }
     }
 }

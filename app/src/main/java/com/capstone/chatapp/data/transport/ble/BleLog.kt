@@ -60,6 +60,10 @@ object BleLog {
         const val BT_STATE = "BT_STATE"
         const val SERVICE = "SERVICE"
         const val PERMISSION = "PERMISSION"
+        const val QUEUE_FULL = "QUEUE_FULL"
+        const val RETRY_SCHEDULE = "RETRY_SCHEDULE"
+        const val REASSEMBLY_DROP = "REASSEMBLY_DROP"
+        const val DUTY_CYCLE = "DUTY_CYCLE"
     }
 
     fun d(step: String, vararg pairs: Pair<String, Any?>) = Log.d(TAG, line(step, pairs))

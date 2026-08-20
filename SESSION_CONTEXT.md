@@ -1,7 +1,7 @@
 # Session Context — Capstone Emergency Chat App
 
 > Snapshot of the work done across sessions. Read this first to pick up where we left off.
-> Last updated: 2026-08-20 (Session 5)
+> Last updated: 2026-08-20 (Session 6)
 
 ---
 
@@ -267,6 +267,94 @@ see, for a targeted 1:1 message:**
   None of these were previously in the project — first real dependency-resolution risk since the
   original Firebase/Compose BOM setup.
 
+### Session 6 (2026-08-20) — mesh reliability hardening (dense / intermittent conditions)
+Branch `feat/mesh-hardening`, built on top of `feat/e2e-encryption`. Goal: the mesh already
+worked for a clean two-phone demo (Session 3); this session hardens it for a **dense room and
+flaky links** — bounded concurrency, retries, bounded memory, storm avoidance, real fragmentation,
+and battery duty-cycling. **Compiled and verified this session**: `:app:compileDebugKotlin` and
+`:app:assembleDebug` both succeed (throwaway placeholder `google-services.json` used to verify,
+then deleted — same workaround as Session 4). **Not run on a device** — still needs the two-phone
+(ideally three-phone, for relay/dedup) pass from `docs/RUNTIME_TEST.md`, now also covering the
+scenarios below.
+
+All new knobs live in `data/transport/ble/BleConstants.kt`, defaults chosen to be safe (don't
+regress the untested mesh's baseline behavior) while still doing real work:
+
+1. **Capped concurrent GATT connections** (`MAX_CONCURRENT_GATT_CONNECTIONS = 5`). The GATT
+   *client* worker was a single fully-serial loop (effectively cap = 1); it's now a bounded pool —
+   `startWorker()`'s dispatch loop still checks writes before identity reads every iteration (same
+   priority as before), but each job now runs on its own coroutine gated by a `Semaphore(5)`
+   (`connectionSemaphore`), so up to 5 *different* devices can be mid-connection at once instead of
+   one at a time. A new per-device `Mutex` (`deviceMutex`, one per address in `deviceMutexes`)
+   wraps `sendToDevice`/`readIdentity` so two workers can never dial the *same* device
+   concurrently — Android's stack doesn't tolerate that regardless of the overall cap.
+2. **Reconnect/retry with exponential backoff + jitter** (`RETRY_BASE_BACKOFF_MS = 500`,
+   `RETRY_MAX_BACKOFF_MS = 8_000`, `RETRY_JITTER_MS = 300`). A failed write or identity read used
+   to just increment a failure counter and wait for the *next* unrelated opportunity (outbox
+   flush / next scan) to retry. Now `scheduleRetry()` actively re-queues the job after
+   `retryBackoffMs(attempt)` (`base * 2^(attempt-1)` capped at max, plus jitter) — up to
+   `NEIGHBOR_FAILURE_LIMIT` (3) attempts before a write-failing neighbour is dropped (unchanged
+   threshold) or an identity read gives up (new: previously only stopped via the 120s sweep).
+3. **Bounded + TTL-evicted seen-set** (`SEEN_MAX = 500` unchanged, new `SEEN_TTL_MS = 15 min`).
+   `seen` changed from `LinkedHashSet<String>` to `LinkedHashMap<String, Long>` (msgId → first-seen
+   time): `addSeen()` still trims to `SEEN_MAX` on overflow, and the sweeper now also calls
+   `evictExpiredSeen()` every `SWEEP_INTERVAL_MS` to drop anything older than the TTL, so a quiet
+   mesh doesn't hold onto old ids indefinitely between the two bounds.
+4. **Stale `NearbyPeer` eviction** — already existed (`PEER_STALE_MS = 120s`, swept in
+   `startSweeper()` since Session 3); left as-is, just confirmed it satisfies this session's ask.
+5. **Randomized re-broadcast jitter** (`REBROADCAST_JITTER_MAX_MS = 400`). `handleIncoming()`'s
+   relay branch now delays `Random.nextLong(0, 401)` ms (logged as `jitterMs`) before calling
+   `enqueueToNeighbors()`, so phones that all just received the same broadcast in the same instant
+   don't all hit the same next-hop neighbours' GATT servers simultaneously. Only applies to
+   *relays*; the original sender's first broadcast is unchanged (still immediate).
+6. **Application-level chunking + reassembly above the negotiated MTU** — new file
+   `data/transport/ble/BleChunk.kt`: every outbound write is now wrapped in a `groupId(4) +
+   seq(2) + total(2)` envelope (`CHUNK_HEADER_SIZE = 8`) and split to fit
+   `negotiatedMtu - 3 - 8` bytes per chunk (floor `CHUNK_MIN_PAYLOAD = 20`, matching the default
+   23-byte ATT MTU if negotiation fails). This replaces reliance on Android's own inconsistent
+   long-write/prepared-write fragmentation for anything we send: `sendToDevice()` now sends one
+   connection's chunks sequentially, waiting for each write ack before the next, and only resolves
+   `TX_OK` once all chunks succeed. On the receiving side, `handleChunkWrite()` parses each
+   envelope; a single-chunk message (the common case — most SOS/chat text fits in one MTU-sized
+   write) is delivered immediately, multi-chunk messages accumulate in a new `reassembly` map
+   (keyed `"address:groupId"`) until complete, then get reassembled and handed to `acceptBytes()`.
+   An incomplete reassembly (sender vanished mid-transfer) is dropped by the sweeper after
+   `REASSEMBLY_TTL_MS = 20s`. The old native `preparedWrite`/`onExecuteWrite` path (Session 3) is
+   left in place defensively but should no longer trigger, since our own writes never exceed the
+   negotiated MTU; if it ever does fire, its reassembled buffer is now also routed through
+   `handleChunkWrite()` instead of being force-fed to `acceptBytes()` directly.
+7. **BLE duty-cycling** for battery. Scan: `SCAN_DUTY_CYCLE_ENABLED = true` by default,
+   `SCAN_WINDOW_ON_MS = 10s` / `SCAN_WINDOW_OFF_MS = 5s` — `startScanDutyCycleLoop()` alternates
+   `stopScan()`/`startScanning()` on that cadence (only while the mesh is running; cancelled in
+   `teardownRadio()` and restarted after a Bluetooth-off/on cycle same as the other radio jobs).
+   Advertise: `ADVERTISE_DUTY_CYCLE_ENABLED = false` by default — an OFF window makes this phone
+   briefly *undiscoverable*, a bigger reliability risk than the battery it saves for an
+   already-fragile, never-run-on-device mesh — but the identical mechanism
+   (`startAdvertiseDutyCycleLoop()`, `ADVERTISE_WINDOW_ON_MS`/`ADVERTISE_WINDOW_OFF_MS`, both 10s/5s)
+   exists and is a one-line flip in `BleConstants` for anyone who wants to trade discoverability
+   for battery life.
+
+**Bounded/politely-dropped job queues** (not explicitly asked for, but required to make #1 safe):
+`writeQueue`/`identityQueue` changed from `Channel.UNLIMITED` to a bounded
+`BleConstants.JOB_QUEUE_CAPACITY = 256`. `trySendWrite()`/`trySendIdentityRead()` wrap the
+`trySend()` calls; on overflow they log `QUEUE_FULL` and roll back the just-set "delivered" /
+`identityRequested` marker so a later opportunity (outbox flush, next scan result) retries instead
+of the message silently vanishing for that neighbour.
+
+**New `BleLog.Step` constants**: `QUEUE_FULL`, `RETRY_SCHEDULE`, `REASSEMBLY_DROP`, `DUTY_CYCLE`.
+
+**Not done / left for later:**
+- **Still not run on a real device.** The two/three-phone `docs/RUNTIME_TEST.md` pass is the
+  actual next step, now also exercising: a dense room (≥5 neighbours) to see the concurrency cap
+  and retry backoff in the logs; a message long enough to force multi-chunk (`CHUNK` log lines,
+  `chunks > 1`); toggling one phone's Bluetooth mid-broadcast to see retry-then-drop; and just
+  watching battery drain with `SCAN_DUTY_CYCLE_ENABLED` on vs. off.
+- Concurrency cap and duty-cycle windows are compile-time constants in `BleConstants`, not
+  runtime-configurable from a settings screen — "configurable" here means "one constant to change
+  and rebuild," per the task's own phrasing, not a user-facing setting.
+- The advertise duty-cycle path is implemented but disabled by default (see #7) — enabling it is
+  an explicit tradeoff someone should make deliberately, not a default for an unverified mesh.
+
 ### Session 3 (2026-08-20) — BLE runtime instrumentation + real-device bug fixes
 Branch `feat/ble-runtime-fixes`. Goal: make the offline SOS broadcast actually work phone-to-phone,
 and make every failure visible in logcat instead of silent. **Still no on-device run** — everything
@@ -414,13 +502,20 @@ com.capstone.chatapp/
       NetworkMonitor.kt        # validated-internet flow (online/offline)
       ble/
         BleConstants.kt        # UUIDs, TTL=10, REACH_CAP=100, MTU=185, timeouts/eviction/outbox windows
+                               #   + NEW Session 6: concurrency cap, retry/backoff, seen TTL, jitter,
+                               #   chunking, duty-cycle knobs (see Session 6 changelog for every default)
+        BleChunk.kt            # NEW Session 6: chunk envelope (groupId+seq+total) split/parse for
+                               #   application-level fragmentation above the negotiated MTU
         BleLog.kt              # single logcat tag "SafeSphereBLE"; step vocabulary + error-code decoding
         BlePacket.kt           # SOS fields; wraps/produces Packet (toPacket/fromPacket) + relayed()
         BleTransport.kt        # Transport wrapping BleMeshManager (flood broadcast, nextHop ignored)
         NearbyPeer.kt          # a person discovered nearby (uid, name, address, lastSeen)
         BleMeshManager.kt      # advertiser + GATT server + scanner + GATT client + flood relay
                                #   + identity read → nearbyPeers + outbox + neighbour eviction
-                               #   + BT-state receiver; all GATT client work serialized (writes first)
+                               #   + BT-state receiver; GATT client work on a bounded (5) concurrent
+                               #   pool with per-device locking (writes still win) — Session 6
+                               #   + retry/backoff, bounded+TTL seen-set, relay jitter, chunking,
+                               #   scan/advertise duty-cycling — all Session 6
         BleMeshService.kt      # foreground service (type connectedDevice) keeping mesh alive
         BlePermissions.kt      # runtime perms per SDK level; essential vs optional; location-toggle check
 ```
@@ -562,22 +657,26 @@ it has run on a phone.** Follow `docs/RUNTIME_TEST.md` and confirm, in order:
   Emergency Mode, the Nearby tab is silently empty with no explanation. Emergency Mode is the only place
   that requests permissions and starts the service.
 - **No offline 1:1** — tapping a Nearby/Discover person opens the *online* Firestore chat.
-- **Encryption for 1:1 chat implemented in Session 5** but **not yet built or run on a device** —
-  see the Session 5 changelog above for the full threat model and what's not compiled/verified.
-  SOS broadcast stays unencrypted (deferred by design — it's a public broadcast).
-- **Battery duty-cycling** — the scanner runs in `SCAN_MODE_LOW_LATENCY` continuously, which is heavy.
-- **Simultaneous-GATT-connection limit (~4–7)** is sidestepped by serializing to one connection at a
-  time, which is safe but slow with many neighbours; no parallelism or connection pooling.
-- **Message chunking above the MTU** is now handled by Android's long-write path (buffered server-side),
-  but there is no application-level fragmentation for genuinely large payloads.
+- **Encryption for 1:1 chat implemented in Session 5** but **still not run on a device** (it does now
+  compile, confirmed in Session 6 — see below). SOS broadcast stays unencrypted by design.
+- ~~Battery duty-cycling~~ / ~~simultaneous-GATT-connection limit~~ / ~~message chunking above the
+  MTU~~ — **all addressed in Session 6** (scan duty-cycling on by default, 5-connection concurrent
+  pool with per-device locking, application-level chunking + reassembly). See the Session 6
+  changelog above. Advertise duty-cycling exists but is off by default (deliberate — see changelog).
 
-**Recommended next step:** drop in `google-services.json`, build (**this session's E2E-encryption
-work has never been compiled — no Gradle/JDK/SDK were available in this environment**, so building
-it for the first time is the actual next step, before the two-phone BLE test below), then run
-`docs/RUNTIME_TEST.md` end to end on two phones and bring back the `SafeSphereBLE` logcat from both.
-Also manually verify the encryption path: sign up two accounts, send a 1:1 message both ways, QR-pair
-them from `Profile → My QR Code / Verify a Contact`, and confirm the safety number matches on both
-phones.
+**Build status as of Session 6:** `:app:compileDebugKotlin` and `:app:assembleDebug` **both succeed**
+on this machine (JDK 17 via Android Studio's bundled JBR, Android SDK present, cached Gradle 8.5) —
+this resolves Session 5's "never compiled" gap for the E2E-encryption code too, since it's on the
+same branch lineage. A throwaway placeholder `google-services.json` was used to verify the build and
+then deleted, same as Session 4 — **do not ship a fake one**, it builds fine but every Firebase call
+fails at runtime.
+
+**Recommended next step:** drop in a real `google-services.json`, then run `docs/RUNTIME_TEST.md`
+end to end on two (ideally three, for relay/dedup) phones and bring back the `SafeSphereBLE` logcat
+from all of them — now also watching for `chunks`, `RETRY_SCHEDULE`, `QUEUE_FULL`, `REASSEMBLY_DROP`
+and `DUTY_CYCLE` lines from Session 6's changes. Also manually verify the encryption path: sign up
+two accounts, send a 1:1 message both ways, QR-pair them from `Profile → My QR Code / Verify a
+Contact`, and confirm the safety number matches on both phones.
 
 ---
 
