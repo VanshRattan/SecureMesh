@@ -1,5 +1,8 @@
 package com.capstone.chatapp.data.repository
 
+import com.capstone.chatapp.data.transport.InternetTransport
+import com.capstone.chatapp.data.transport.SendResult
+import com.capstone.chatapp.data.transport.Tier
 import com.capstone.chatapp.data.transport.ble.BlePacket
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.FirebaseFirestore
@@ -7,7 +10,6 @@ import com.google.firebase.firestore.Query
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
-import kotlinx.coroutines.tasks.await
 
 /**
  * Internet path for emergency broadcasts: a shared Firestore `emergencies` collection
@@ -15,8 +17,15 @@ import kotlinx.coroutines.tasks.await
  * is sent here in addition to the BLE mesh (dual-send), so it reaches both nearby
  * offline phones and anyone online. Messages are keyed by the same msgId as the BLE
  * packet, so a device receiving both copies de-duplicates them.
+ *
+ * Sending wraps the SOS as a transport-agnostic [com.capstone.chatapp.data.transport.Packet]
+ * and hands it to [InternetTransport] — this repository no longer talks to Firestore directly
+ * for writes, only for the realtime read below.
  */
-class EmergencyRepository(private val firestore: FirebaseFirestore = FirebaseFirestore.getInstance()) {
+class EmergencyRepository(
+    private val internetTransport: InternetTransport,
+    private val firestore: FirebaseFirestore = FirebaseFirestore.getInstance(),
+) {
 
     private val collection get() = firestore.collection("emergencies")
 
@@ -45,13 +54,7 @@ class EmergencyRepository(private val firestore: FirebaseFirestore = FirebaseFir
     }
 
     suspend fun publish(packet: BlePacket) {
-        val data = hashMapOf(
-            "senderId" to packet.senderId,
-            "senderName" to packet.senderName,
-            "text" to packet.text,
-            "timestamp" to Timestamp.now(),
-        )
-        // Use msgId as the document id so BLE and internet copies collide (de-dup).
-        collection.document(packet.msgId).set(data).await()
+        val result = internetTransport.sendToNextHop(packet.toPacket(), nextHop = null, tier = Tier.INTERNET)
+        check(result == SendResult.SENT) { "Failed to publish emergency broadcast" }
     }
 }

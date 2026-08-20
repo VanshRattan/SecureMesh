@@ -2,6 +2,11 @@ package com.capstone.chatapp.data.repository
 
 import com.capstone.chatapp.data.model.ChatSummary
 import com.capstone.chatapp.data.model.Message
+import com.capstone.chatapp.data.transport.InternetTransport
+import com.capstone.chatapp.data.transport.Packet
+import com.capstone.chatapp.data.transport.Priority
+import com.capstone.chatapp.data.transport.SendResult
+import com.capstone.chatapp.data.transport.Tier
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
@@ -10,13 +15,22 @@ import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.tasks.await
+import java.util.UUID
 
 /**
  * Firestore access for chat messages: chats/{chatId}/messages/{messageId}.
  * Exposes messages as a cold Flow (wrapping the realtime snapshot listener) so
  * ViewModels can collect them without knowing about Firebase.
+ *
+ * Sending wraps the message as a transport-agnostic [Packet] (destId = peer, srcId = sender)
+ * and hands it to [InternetTransport] for the actual message-doc write; the chat-summary
+ * upsert below it is index bookkeeping for the Home list, not part of the wire packet, so it
+ * stays a direct Firestore write here.
  */
-class ChatRepository(private val firestore: FirebaseFirestore = FirebaseFirestore.getInstance()) {
+class ChatRepository(
+    private val internetTransport: InternetTransport,
+    private val firestore: FirebaseFirestore = FirebaseFirestore.getInstance(),
+) {
 
     private val chats get() = firestore.collection("chats")
 
@@ -50,15 +64,21 @@ class ChatRepository(private val firestore: FirebaseFirestore = FirebaseFirestor
         peerName: String,
         text: String,
     ) {
-        val now = Timestamp.now()
-        val data = hashMapOf(
-            "senderId" to senderId,
-            "text" to text,
-            "timestamp" to now,
+        val packet = Packet(
+            msgId = UUID.randomUUID().toString(),
+            destId = peerId,
+            srcId = senderId,
+            ttl = 1,
+            priority = Priority.NORMAL,
+            tierTag = Tier.INTERNET,
+            nonce = ByteArray(0),
+            payload = text.toByteArray(Charsets.UTF_8),
         )
-        messagesRef(chatId).add(data).await()
+        val result = internetTransport.sendToNextHop(packet, nextHop = peerId, tier = Tier.INTERNET)
+        check(result == SendResult.SENT) { "Failed to send message" }
 
         // Upsert the parent chat summary so both users can list this thread on Home.
+        val now = Timestamp.now()
         val summary = hashMapOf(
             "participants" to listOf(senderId, peerId),
             "names" to mapOf(senderId to senderName, peerId to peerName),

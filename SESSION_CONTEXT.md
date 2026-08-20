@@ -69,6 +69,85 @@ surfaces are unchanged from Session 1 (i.e. still nothing verified on a device �
 **Firebase console changes now required (see §7):** the new `chats/{chatId}` parent doc needs a rule,
 and the Home list query needs a composite index on `chats` (`participants` array + `lastTimestamp` desc).
 
+### Session 4 (2026-08-20) — transport-abstraction layer + unified packet format
+Branch `feat/transport-abstraction`. Goal: stop higher layers from talking to a bearer (BLE GATT,
+Firestore) directly, so a third tier (Wi-Fi Direct) and, later, end-to-end encryption slot in without
+touching repositories or ViewModels. Purely a refactor — **no UI-observable behavior changed**, and
+`:app:assembleDebug` succeeds (verified with a throwaway placeholder `google-services.json`, deleted
+after — see §8, still missing for real).
+
+**New — `data/transport/Transport.kt`.** `interface Transport { suspend fun sendToNextHop(packet,
+nextHop, tier): SendResult; val incoming: Flow<Packet>; fun isAvailable(): Boolean }` plus
+`enum SendResult { SENT, QUEUED, FAILED, UNAVAILABLE }`. Every bearer implements this; nothing above
+it is allowed to know whether a packet went out over Bluetooth or the internet.
+
+**New — `data/transport/Tier.kt`.** `enum Tier { INTERNET, WIFI_DIRECT, BLE_MESH }` — the three tiers
+from the SafeSphere paper's target end-state (see `CLAUDE.md` §5). Only two are implemented; Wi-Fi
+Direct is a stub (below).
+
+**New — `data/transport/Packet.kt`.** The one wire format every bearer ultimately carries: a cleartext
+header (`version`, `msgId`, `destId` nullable = broadcast, `srcId` nullable, `ttl`, `priority` enum
+`NORMAL`/`EMERGENCY`, `tierTag`, `nonce`) plus an opaque `payload: ByteArray`. `serialize()`/
+`deserialize()` use a compact `DataOutputStream`/`DataInputStream` binary framing (length-prefixed
+strings + byte arrays), not the old manual `'|'`-join, so it round-trips arbitrary bytes safely. The
+header is deliberately plaintext-forever; `payload` is plaintext today and becomes ciphertext once
+E2E encryption lands (Session 3 of the original plan) — that's the whole point of the split.
+
+**`BlePacket` migrated to wrap/produce `Packet`** (`data/transport/ble/BlePacket.kt`). Public API
+(fields, `toBytes()`, `fromBytes()`, `relayed()`) is **byte-for-byte unchanged** for every existing
+caller (`BleMeshManager`, `EmergencyViewModel`, `EmergencyRepository`) — only the internals moved:
+`msgId`/`ttl`/`senderId` now live in `Packet`'s header (`srcId`), and `senderName`/`timestamp`/
+`hopCount`/`reachCount`/`text` are packed into `Packet.payload` (still `'|'`-joined, still
+human-debuggable in logcat). `toBytes()` = `toPacket().serialize()`; `fromBytes()` = `Packet
+.deserialize()` + `fromPacket()`. **`BleMeshManager` needed zero changes** — it only ever called
+`packet.toBytes()` / `BlePacket.fromBytes()`, which still exist with the same signatures.
+
+**New — `BleTransport` (`data/transport/ble/BleTransport.kt`).** Wraps `BleMeshManager`. The mesh is a
+flood, not point-to-point, so `nextHop` is ignored — `sendToNextHop` always broadcasts via
+`mesh.send()`. `incoming` = `mesh.incoming.map { it.toPacket() }`. `isAvailable()` = `mesh.status.value
+.running`.
+
+**New — `InternetTransport` (`data/transport/InternetTransport.kt`).** Wraps Firestore directly (own
+`firestore` instance, not a wrapper around the repositories — avoids a repository ↔ transport
+circular dependency). `sendToNextHop`: `destId == null` → writes the `emergencies` doc (unwraps the
+packet back to a `BlePacket` for the `senderId`/`senderName`/`text` fields, unchanged shape);
+`destId != null` → writes to `chats/{chatId}/messages` where `chatId` is re-derived from
+`srcId`/`destId` via the existing `Message.getChatId` (deterministic, both sides already agree on it).
+`incoming` only carries **broadcast** SOS traffic (mirrors what `EmergencyRepository.observeEmergencies`
+already exposed) — targeted 1:1 messages stay observed per-chat by `ChatRepository.observeMessages`,
+since a global `Flow<Packet>` has no natural way to represent "all chats a screen isn't currently
+open on." **Firestore document shapes are unchanged** — same fields, same collections, so no new
+rules/index needed beyond what §7 already documents.
+
+**New — `WifiDirectTransport` (`data/transport/WifiDirectTransport.kt`).** Stub: `isAvailable() =
+false`, `sendToNextHop` always returns `UNAVAILABLE`, `incoming = emptyFlow()`. `TODO(Session 5)`.
+Registered in `AppContainer` now so a future per-hop arbiter can already be written against the full
+`Tier` set.
+
+**`EmergencyRepository` and `ChatRepository` now build a `Packet` and call `InternetTransport`**
+instead of writing to Firestore directly for sends (reads/`observe*` are unchanged — those still query
+Firestore directly, since that's a repository-level concern, not a "send"). Both constructors now take
+`InternetTransport` as a parameter. `ChatRepository.sendMessage` additionally still does the
+`chats/{chatId}` summary upsert (denormalized names for the Home list) as a **direct** Firestore write
+after the transport call succeeds — that's index bookkeeping for the UI, not part of the wire packet,
+so it deliberately stays outside the `Transport` abstraction.
+
+**`AppContainer` wiring:** `internetTransport`, `bleTransport`, `wifiDirectTransport` constructed
+before the repositories; `chatRepository`/`emergencyRepository` now take `internetTransport` as a
+constructor arg. `EmergencyViewModel`/`ChatViewModel` call sites are **untouched** — same method
+signatures on both repositories.
+
+**Not done / left for later:**
+- `ChatRepository`/`EmergencyViewModel` still call `BleMeshManager`/`Firestore`-backed repositories
+  directly rather than picking a tier through a real arbiter — there's no "auto-switch" logic living
+  above the transports yet, just two independent send calls (BLE + internet) exactly as before. Building
+  the actual per-hop arbiter (availability/congestion/energy/priority-driven) is future work, now that
+  `Tier`/`Transport`/`Packet` exist for it to be built against.
+- No offline 1:1 over BLE — `ChatRepository` only ever calls `InternetTransport`; nothing calls
+  `BleTransport` for a targeted (non-broadcast) packet yet.
+- `nonce` is always `ByteArray(0)` — no encryption yet, so there's nothing to carry an IV/nonce for.
+- Not run on a device this session (pure refactor, verified by `:app:assembleDebug` only).
+
 ### Session 3 (2026-08-20) — BLE runtime instrumentation + real-device bug fixes
 Branch `feat/ble-runtime-fixes`. Goal: make the offline SOS broadcast actually work phone-to-phone,
 and make every failure visible in logcat instead of silent. **Still no on-device run** — everything
@@ -200,11 +279,17 @@ com.capstone.chatapp/
                    observeRecentChats + chat-summary upsert), EmergencyRepository (Firestore
                    `emergencies`), SettingsRepository (DataStore)
     transport/
+      Tier.kt                 # enum INTERNET / WIFI_DIRECT / BLE_MESH
+      Packet.kt               # transport-agnostic wire format: cleartext header + opaque payload
+      Transport.kt            # interface every bearer implements + SendResult enum
+      InternetTransport.kt    # Transport over Firestore (emergencies + chats/{chatId}/messages)
+      WifiDirectTransport.kt  # TODO(Session 5) stub — always UNAVAILABLE
       NetworkMonitor.kt        # validated-internet flow (online/offline)
       ble/
         BleConstants.kt        # UUIDs, TTL=10, REACH_CAP=100, MTU=185, timeouts/eviction/outbox windows
         BleLog.kt              # single logcat tag "SafeSphereBLE"; step vocabulary + error-code decoding
-        BlePacket.kt           # wire format + serialize/deserialize + relayed()
+        BlePacket.kt           # SOS fields; wraps/produces Packet (toPacket/fromPacket) + relayed()
+        BleTransport.kt        # Transport wrapping BleMeshManager (flood broadcast, nextHop ignored)
         NearbyPeer.kt          # a person discovered nearby (uid, name, address, lastSeen)
         BleMeshManager.kt      # advertiser + GATT server + scanner + GATT client + flood relay
                                #   + identity read → nearbyPeers + outbox + neighbour eviction
