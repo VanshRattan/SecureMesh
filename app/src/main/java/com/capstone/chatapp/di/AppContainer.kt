@@ -11,9 +11,10 @@ import com.capstone.chatapp.data.repository.UserRepository
 import com.capstone.chatapp.data.security.CryptoManager
 import com.capstone.chatapp.data.transport.InternetTransport
 import com.capstone.chatapp.data.transport.NetworkMonitor
-import com.capstone.chatapp.data.transport.WifiDirectTransport
 import com.capstone.chatapp.data.transport.ble.BleMeshManager
 import com.capstone.chatapp.data.transport.ble.BleTransport
+import com.capstone.chatapp.data.transport.wifidirect.WifiDirectManager
+import com.capstone.chatapp.data.transport.wifidirect.WifiDirectTransport
 
 /**
  * Tiny manual DI container — holds the single instances of each repository and the
@@ -35,11 +36,13 @@ class AppContainer(context: Context) {
     val networkMonitor: NetworkMonitor = NetworkMonitor(appContext)
     // Singleton so the UI and the foreground service observe/drive the same mesh.
     val bleMeshManager: BleMeshManager = BleMeshManager(appContext)
+    // Singleton for the same reason as bleMeshManager: one Wi-Fi Direct group per process.
+    val wifiDirectManager: WifiDirectManager = WifiDirectManager(appContext)
 
     // The Transport layer: everything above this talks Packets, never a bearer directly.
     val internetTransport: InternetTransport = InternetTransport()
     val bleTransport: BleTransport = BleTransport(bleMeshManager)
-    val wifiDirectTransport: WifiDirectTransport = WifiDirectTransport() // TODO(Session 6)
+    val wifiDirectTransport: WifiDirectTransport = WifiDirectTransport(wifiDirectManager)
 
     val chatRepository: ChatRepository =
         ChatRepository(internetTransport, userRepository, cryptoManager, contactSecurityStore)

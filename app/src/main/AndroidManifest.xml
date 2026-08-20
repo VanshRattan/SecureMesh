@@ -16,8 +16,23 @@
     <!-- Bluetooth LE: legacy (API <= 30) permissions -->
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
     <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
-    <!-- Location was required to scan for BLE on Android 11 and below -->
-    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="30" />
+    <!--
+      Location was required to scan for BLE on Android 11 and below (capped at 30 there).
+      Wi-Fi Direct peer discovery needs it up through Android 12L (API 32) regardless of the
+      BLE `neverForLocation` exemption below, since it rides the platform's Wi-Fi scan
+      subsystem, not the Bluetooth one — see WifiDirectPermissions. Android 13+ uses
+      NEARBY_WIFI_DEVICES instead (below).
+    -->
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" android:maxSdkVersion="32" />
+
+    <!-- Wi-Fi Direct: peer discovery, group formation, socket transport -->
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation"
+        tools:targetApi="tiramisu" />
+    <uses-feature android:name="android.hardware.wifi.direct" android:required="false" />
 
     <!-- Foreground service to keep the mesh alive with the screen off -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />

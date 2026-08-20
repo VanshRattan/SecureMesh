@@ -1,7 +1,7 @@
 # Session Context — Capstone Emergency Chat App
 
 > Snapshot of the work done across sessions. Read this first to pick up where we left off.
-> Last updated: 2026-08-20 (Session 6)
+> Last updated: 2026-08-20 (Session 7)
 
 ---
 
@@ -266,6 +266,81 @@ see, for a targeted 1:1 message:**
   core:3.5.3`, `androidx.camera:{camera-core,camera-camera2,camera-lifecycle,camera-view}:1.3.1`.
   None of these were previously in the project — first real dependency-resolution risk since the
   original Firebase/Compose BOM setup.
+
+### Session 7 (2026-08-20) — Wi-Fi Direct tier (the missing middle transport)
+Branch `feat/wifi-direct-tier`, built on top of `feat/mesh-hardening`. Goal: implement the
+`WIFI_DIRECT` tier behind the existing `Transport` interface — the stub from Session 4 is now
+a real implementation. **Compiled and verified this session**: `:app:compileDebugKotlin` and
+`:app:assembleDebug` both succeed (throwaway placeholder `google-services.json`, deleted
+after — same workaround as Sessions 4/6). **Not run on a device** — see
+`docs/WIFIDIRECT_TEST.md`, new this session, for the two-phone procedure (it also has to
+document temporary manual triggers, since this session deliberately did not wire the tier
+into any screen or arbiter — see below).
+
+**New package — `data/transport/wifidirect/`** (mirrors the `ble/` package's shape and
+`STEP | key=value` logcat convention, own tag `SafeSphereWifiDirect`):
+- `WifiDirectManager.kt` — peer discovery (`WifiP2pManager.discoverPeers`, re-issued every
+  20s since discovery auto-stops after ~2 min on most OEMs), group formation
+  (`connectToPeer` → `WifiP2pManager.connect`, role decided by the platform's GO-intent
+  negotiation, not requested), and a socket relay: the Group Owner runs a `ServerSocket` on
+  port 8988 and accepts one socket per client; a non-GO client holds one long-lived socket to
+  the GO (fixed address `192.168.49.1`, hard-coded per the stock-Android constraint — see the
+  class doc for why that's safe). Exposes `status: StateFlow<WifiDirectStatus>`,
+  `peers: StateFlow<List<WifiDirectPeer>>`, `incoming: SharedFlow<Packet>` (replay=32, same
+  as `BleMeshManager.incoming`), and `suspend fun send(packet): Boolean`.
+- `WifiDirectFrame.kt` — 4-byte length-prefix framing for `Packet` bytes over the TCP stream
+  (TCP has no message boundaries, unlike one BLE GATT write); no chunking needed since TCP
+  already handles fragmentation/reassembly at the stream level, unlike `BleChunk`.
+- `WifiDirectPermissions.kt` — `NEARBY_WIFI_DEVICES` on API 33+ (declared `neverForLocation`,
+  same reasoning as BLE's `BLUETOOTH_SCAN`), `ACCESS_FINE_LOCATION` below that. Reuses
+  `BlePermissions.isLocationServiceOn` for the pre-13 location-toggle check rather than
+  duplicating it — that check was never actually BLE-specific.
+- `WifiDirectConstants.kt`, `WifiDirectLog.kt`, `WifiDirectPeer.kt` — same shape as their
+  `ble/` counterparts.
+- `WifiDirectTransport.kt` — wraps `WifiDirectManager` as a `Transport`, same pattern as
+  `BleTransport` wraps `BleMeshManager`. `nextHop` is ignored (the group is a star; `send`
+  already fans out to every connected socket).
+
+**Topology and the "one group" constraint.** Stock Android only ever gives an app one active
+Wi-Fi Direct group; every client's traffic flows through the Group Owner at the fixed address
+`192.168.49.1`. Within that one group, `WifiDirectManager.handleIncomingFrame` makes the star
+behave like the BLE flood for a single hop: the GO relays an incoming packet to every *other*
+connected client. **Multi-group multi-hop (the general mesh case) is explicitly out of scope
+this session** — documented as a "Path to multi-hop" note in `WifiDirectManager`'s class doc
+rather than attempted, since it needs either repeated group teardown/reformation or newer,
+more restrictive platform APIs this session didn't have time to evaluate.
+
+**Manifest (`AndroidManifest.xml`).** Added `ACCESS_WIFI_STATE`, `CHANGE_WIFI_STATE`,
+`CHANGE_NETWORK_STATE`, `NEARBY_WIFI_DEVICES` (`neverForLocation`), and
+`<uses-feature android:name="android.hardware.wifi.direct" android:required="false" />`.
+**Extended the existing `ACCESS_FINE_LOCATION` entry's `maxSdkVersion` from 30 to 32** — BLE
+only needed it capped at 30 (exempt via `neverForLocation` at API 31+), but Wi-Fi Direct
+peer discovery rides the platform's Wi-Fi scan subsystem and needs location up through API 32
+regardless; `NEARBY_WIFI_DEVICES` only takes over at 33.
+
+**`AppContainer` wiring:** new singleton `wifiDirectManager: WifiDirectManager`;
+`wifiDirectTransport` now wraps it instead of being the Session 4 stub. The old
+`data/transport/WifiDirectTransport.kt` stub file was deleted — the real implementation
+lives in `data/transport/wifidirect/` instead, matching where `BleTransport` lives relative
+to `BleMeshManager`. No other file referenced the stub (confirmed by grep before deleting).
+
+**Not done / left for later:**
+- **Not wired into any screen or the per-hop arbiter.** Nothing calls
+  `wifiDirectManager.start()` or `connectToPeer()` yet — there's no arbiter to decide when to
+  prefer Wi-Fi Direct over BLE/Internet, and no screen exposing "nearby via Wi-Fi Direct" the
+  way `EmergencyScreen`/`DiscoverScreen` do for BLE. `docs/WIFIDIRECT_TEST.md` §0.2/§3
+  documents the temporary manual hooks needed to exercise it on a device right now.
+- **No persistent group / auto-reconnect.** A dropped connection requires calling
+  `connectToPeer` again by hand; there's no BLE-tier-style retry/backoff loop for it.
+- **No offline 1:1 over Wi-Fi Direct** — `Packet.destId` is carried end-to-end so a future
+  arbiter/repository change could route a targeted message this way, but nothing does yet.
+- **Not run on a real device this session** — code-reviewed and `:app:assembleDebug`-verified
+  only; `docs/WIFIDIRECT_TEST.md` is the actual next step, on two (ideally three, for the
+  relay test) phones.
+- **`CLAUDE.md` was corrupted** at the start of this session (it contained leftover assistant
+  chat narration wrapped around the real content in a markdown fence, from some prior
+  process accidentally writing chat output into the file instead of just its content) —
+  cleaned up as a drive-by fix, unrelated to the Wi-Fi Direct work itself.
 
 ### Session 6 (2026-08-20) — mesh reliability hardening (dense / intermittent conditions)
 Branch `feat/mesh-hardening`, built on top of `feat/e2e-encryption`. Goal: the mesh already
