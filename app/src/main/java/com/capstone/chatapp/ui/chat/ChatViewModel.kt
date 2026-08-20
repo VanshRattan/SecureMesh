@@ -1,0 +1,79 @@
+package com.capstone.chatapp.ui.chat
+
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.capstone.chatapp.data.model.Message
+import com.capstone.chatapp.data.repository.AuthRepository
+import com.capstone.chatapp.data.repository.ChatRepository
+import com.capstone.chatapp.data.repository.UserRepository
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+data class ChatUiState(
+    val messages: List<Message> = emptyList(),
+    val isSending: Boolean = false,
+    val errorMessage: String? = null,
+)
+
+/**
+ * Observes and sends messages for the 1:1 chat between the current user and [peerUid].
+ * chatId is deterministic (see [Message.getChatId]) so both users share one thread.
+ */
+class ChatViewModel(
+    private val chatRepository: ChatRepository,
+    authRepository: AuthRepository,
+    userRepository: UserRepository,
+    private val peerUid: String,
+    private val peerName: String,
+) : ViewModel() {
+
+    val currentUid: String = authRepository.currentUid.orEmpty()
+    private val chatId: String = Message.getChatId(currentUid, peerUid)
+
+    // My display name, stamped onto the chat summary so the peer sees a real name.
+    private var myName: String = authRepository.currentEmail?.substringBefore('@') ?: "Me"
+
+    private val _state = MutableStateFlow(ChatUiState())
+    val state: StateFlow<ChatUiState> = _state.asStateFlow()
+
+    init {
+        viewModelScope.launch {
+            runCatching { userRepository.getUser(currentUid) }.getOrNull()?.let { user ->
+                if (user.displayName.isNotBlank()) myName = user.displayName
+            }
+        }
+        viewModelScope.launch {
+            chatRepository.observeMessages(chatId)
+                .catch { e -> _state.update { it.copy(errorMessage = e.message ?: "Error loading messages") } }
+                .collect { messages -> _state.update { it.copy(messages = messages) } }
+        }
+    }
+
+    fun consumeError() = _state.update { it.copy(errorMessage = null) }
+
+    fun sendMessage(text: String) {
+        val trimmed = text.trim()
+        if (trimmed.isEmpty()) return
+        _state.update { it.copy(isSending = true) }
+        viewModelScope.launch {
+            try {
+                chatRepository.sendMessage(
+                    chatId = chatId,
+                    senderId = currentUid,
+                    senderName = myName,
+                    peerId = peerUid,
+                    peerName = peerName,
+                    text = trimmed,
+                )
+            } catch (e: Exception) {
+                _state.update { it.copy(errorMessage = "Failed to send message") }
+            } finally {
+                _state.update { it.copy(isSending = false) }
+            }
+        }
+    }
+}
