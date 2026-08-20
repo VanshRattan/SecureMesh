@@ -33,7 +33,9 @@ fun SignupScreen(
 ) {
     val container = LocalContext.current.appContainer()
     val vm: SignupViewModel = viewModel(factory = viewModelFactory {
-        initializer { SignupViewModel(container.authRepository, container.userRepository) }
+        initializer {
+            SignupViewModel(container.authRepository, container.userRepository, container.cryptoManager)
+        }
     })
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }

@@ -1,7 +1,10 @@
 package com.capstone.chatapp.data.repository
 
+import android.util.Base64
+import com.capstone.chatapp.data.local.ContactSecurityStore
 import com.capstone.chatapp.data.model.ChatSummary
 import com.capstone.chatapp.data.model.Message
+import com.capstone.chatapp.data.security.CryptoManager
 import com.capstone.chatapp.data.transport.InternetTransport
 import com.capstone.chatapp.data.transport.Packet
 import com.capstone.chatapp.data.transport.Priority
@@ -22,13 +25,22 @@ import java.util.UUID
  * Exposes messages as a cold Flow (wrapping the realtime snapshot listener) so
  * ViewModels can collect them without knowing about Firebase.
  *
- * Sending wraps the message as a transport-agnostic [Packet] (destId = peer, srcId = sender)
- * and hands it to [InternetTransport] for the actual message-doc write; the chat-summary
+ * Sending encrypts the text with [CryptoManager] (X25519 + HKDF + AES-256-GCM, see that class
+ * for the full scheme), wraps the ciphertext as a transport-agnostic [Packet] (destId = peer,
+ * srcId = sender) and hands it to [InternetTransport] for the message-doc write; the chat-summary
  * upsert below it is index bookkeeping for the Home list, not part of the wire packet, so it
- * stays a direct Firestore write here.
+ * stays a direct Firestore write here. The summary deliberately carries no plaintext preview —
+ * see the comment in [sendMessage] — so Firestore never sees 1:1 message content at all.
+ *
+ * Receiving decrypts in [observeMessages], which is the only place a targeted packet's payload
+ * is ever opened — relays (Firestore, and later BLE/Wi-Fi-Direct for offline 1:1) never call
+ * [CryptoManager.decryptFrom].
  */
 class ChatRepository(
     private val internetTransport: InternetTransport,
+    private val userRepository: UserRepository,
+    private val cryptoManager: CryptoManager,
+    private val contactSecurityStore: ContactSecurityStore,
     private val firestore: FirebaseFirestore = FirebaseFirestore.getInstance(),
 ) {
 
@@ -37,8 +49,26 @@ class ChatRepository(
     private fun messagesRef(chatId: String) =
         chats.document(chatId).collection("messages")
 
-    /** Realtime stream of messages for a chat, ordered oldest-first. */
-    fun observeMessages(chatId: String): Flow<List<Message>> = callbackFlow {
+    /**
+     * Resolves + caches [peerId]'s published public key: the local cache first (works offline,
+     * and is how a QR-paired contact's key is found before they've ever been fetched online),
+     * falling back to their Firestore profile. Throws if neither has it — meaning the peer has
+     * never logged in since encryption shipped, so there is nothing to encrypt to yet.
+     */
+    private suspend fun resolvePeerPublicKey(myUid: String, peerId: String): String {
+        contactSecurityStore.getCachedPeerPublicKey(myUid, peerId)?.let { return it }
+        val fetched = userRepository.getUser(peerId)?.pubKey
+        require(!fetched.isNullOrBlank()) { "This contact hasn't set up encryption yet" }
+        contactSecurityStore.cachePeerPublicKey(myUid, peerId, fetched)
+        return fetched
+    }
+
+    /** Realtime stream of messages for a chat, ordered oldest-first, decrypted for display. */
+    fun observeMessages(chatId: String, myUid: String, peerId: String): Flow<List<Message>> = callbackFlow {
+        // Resolved once per subscription, not per message: the derived key is static for the
+        // pair as long as neither public key changes (see CryptoManager).
+        val peerPubKey = runCatching { resolvePeerPublicKey(myUid, peerId) }.getOrNull()
+
         val registration = messagesRef(chatId)
             .orderBy("timestamp", Query.Direction.ASCENDING)
             .addSnapshotListener { snapshot, error ->
@@ -48,7 +78,13 @@ class ChatRepository(
                 }
                 val messages = snapshot?.documents?.mapNotNull { doc ->
                     val senderId = doc.getString("senderId") ?: return@mapNotNull null
-                    val text = doc.getString("text") ?: return@mapNotNull null
+                    val cipherB64 = doc.getString("ciphertext") ?: return@mapNotNull null
+                    val text = peerPubKey?.let { pub ->
+                        runCatching {
+                            val bytes = Base64.decode(cipherB64, Base64.NO_WRAP)
+                            String(cryptoManager.decryptFrom(peerId, pub, bytes), Charsets.UTF_8)
+                        }.getOrNull()
+                    } ?: "🔒 Unable to decrypt this message"
                     Message(senderId, text, doc.getTimestamp("timestamp"))
                 }.orEmpty()
                 trySend(messages)
@@ -64,6 +100,9 @@ class ChatRepository(
         peerName: String,
         text: String,
     ) {
+        val peerPubKey = resolvePeerPublicKey(senderId, peerId)
+        val ciphertext = cryptoManager.encryptFor(peerId, peerPubKey, text.toByteArray(Charsets.UTF_8))
+
         val packet = Packet(
             msgId = UUID.randomUUID().toString(),
             destId = peerId,
@@ -71,18 +110,20 @@ class ChatRepository(
             ttl = 1,
             priority = Priority.NORMAL,
             tierTag = Tier.INTERNET,
-            nonce = ByteArray(0),
-            payload = text.toByteArray(Charsets.UTF_8),
+            nonce = ByteArray(0), // AesGcmJce bundles its own random IV inside the payload
+            payload = ciphertext,
         )
         val result = internetTransport.sendToNextHop(packet, nextHop = peerId, tier = Tier.INTERNET)
         check(result == SendResult.SENT) { "Failed to send message" }
 
-        // Upsert the parent chat summary so both users can list this thread on Home.
+        // Upsert the parent chat summary so both users can list this thread on Home. No
+        // plaintext preview here on purpose: this doc is readable by anyone the Firestore rules
+        // allow, so the "last message" field must stay generic to keep the relay blind.
         val now = Timestamp.now()
         val summary = hashMapOf(
             "participants" to listOf(senderId, peerId),
             "names" to mapOf(senderId to senderName, peerId to peerName),
-            "lastMessage" to text,
+            "lastMessage" to "🔒 New message",
             "lastTimestamp" to now,
         )
         chats.document(chatId).set(summary, SetOptions.merge()).await()

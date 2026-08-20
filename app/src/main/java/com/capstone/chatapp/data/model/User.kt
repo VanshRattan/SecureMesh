@@ -8,6 +8,8 @@ data class User(
     val uid: String = "",
     val email: String = "",
     val username: String = "",
+    /** Base64 X25519 public key published at signup/login — see data/security/CryptoManager.kt. */
+    val pubKey: String = "",
 ) {
     /** Best display name: explicit username, else the part of the email before '@'. */
     val displayName: String

@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.capstone.chatapp.data.repository.AuthRepository
 import com.capstone.chatapp.data.repository.SettingsRepository
 import com.capstone.chatapp.data.repository.UserRepository
+import com.capstone.chatapp.data.security.CryptoManager
 import com.capstone.chatapp.ui.theme.ThemeMode
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
@@ -29,6 +30,7 @@ class ProfileViewModel(
     private val authRepository: AuthRepository,
     private val userRepository: UserRepository,
     private val settingsRepository: SettingsRepository,
+    private val cryptoManager: CryptoManager,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(ProfileUiState())
@@ -93,6 +95,7 @@ class ProfileViewModel(
 
     fun logout() {
         authRepository.signOut()
+        cryptoManager.clear()
         _state.update { it.copy(loggedOut = true) }
     }
 }

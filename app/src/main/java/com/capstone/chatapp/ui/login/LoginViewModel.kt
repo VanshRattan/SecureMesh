@@ -3,6 +3,8 @@ package com.capstone.chatapp.ui.login
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.capstone.chatapp.data.repository.AuthRepository
+import com.capstone.chatapp.data.repository.UserRepository
+import com.capstone.chatapp.data.security.CryptoManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -20,7 +22,11 @@ data class LoginUiState(
 )
 
 /** Holds login form state (survives rotation) and performs sign-in. */
-class LoginViewModel(private val authRepository: AuthRepository) : ViewModel() {
+class LoginViewModel(
+    private val authRepository: AuthRepository,
+    private val userRepository: UserRepository,
+    private val cryptoManager: CryptoManager,
+) : ViewModel() {
 
     private val _state = MutableStateFlow(LoginUiState())
     val state: StateFlow<LoginUiState> = _state.asStateFlow()
@@ -42,7 +48,11 @@ class LoginViewModel(private val authRepository: AuthRepository) : ViewModel() {
         _state.update { it.copy(isLoading = true) }
         viewModelScope.launch {
             try {
-                authRepository.signIn(email, password)
+                val uid = authRepository.signIn(email, password)
+                cryptoManager.bind(uid)
+                // Publish/refresh the public key on every login too, not just signup, so a
+                // reinstall (new identity key) or a lapsed profile self-heals.
+                runCatching { userRepository.publishPublicKey(uid, cryptoManager.publicKeyBase64()) }
                 _state.update { it.copy(isLoading = false, loggedIn = true) }
             } catch (e: Exception) {
                 _state.update { it.copy(isLoading = false, errorMessage = e.message ?: "Login failed") }

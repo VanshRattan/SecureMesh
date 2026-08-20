@@ -53,11 +53,17 @@ import com.capstone.chatapp.ui.theme.ThemeMode
 fun ProfileScreen(
     onBack: () -> Unit,
     onLoggedOut: () -> Unit,
+    onOpenPairing: () -> Unit,
 ) {
     val container = LocalContext.current.appContainer()
     val vm: ProfileViewModel = viewModel(factory = viewModelFactory {
         initializer {
-            ProfileViewModel(container.authRepository, container.userRepository, container.settingsRepository)
+            ProfileViewModel(
+                container.authRepository,
+                container.userRepository,
+                container.settingsRepository,
+                container.cryptoManager,
+            )
         }
     })
     val state by vm.state.collectAsStateWithLifecycle()
@@ -134,6 +140,23 @@ fun ProfileScreen(
                 style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+
+            Spacer(Modifier.height(4.dp))
+
+            // Encryption
+            Text("Encryption", style = MaterialTheme.typography.titleLarge)
+            Text(
+                "Messages to your contacts are end-to-end encrypted. Show your QR code or scan " +
+                    "someone else's in person to verify you're really talking to them.",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            OutlinedButton(
+                onClick = onOpenPairing,
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+            ) {
+                Text("My QR Code / Verify a Contact", style = MaterialTheme.typography.labelLarge)
+            }
 
             Spacer(Modifier.height(12.dp))
 

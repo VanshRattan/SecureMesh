@@ -1,7 +1,7 @@
 # Session Context — Capstone Emergency Chat App
 
 > Snapshot of the work done across sessions. Read this first to pick up where we left off.
-> Last updated: 2026-08-20
+> Last updated: 2026-08-20 (Session 5)
 
 ---
 
@@ -148,6 +148,125 @@ signatures on both repositories.
 - `nonce` is always `ByteArray(0)` — no encryption yet, so there's nothing to carry an IV/nonce for.
 - Not run on a device this session (pure refactor, verified by `:app:assembleDebug` only).
 
+### Session 5 (2026-08-20) — end-to-end encryption + relay-node blindness for 1:1 messages
+Branch `feat/e2e-encryption`. Goal: targeted 1:1 messages are now encrypted so Firestore (and any
+future BLE/Wi-Fi-Direct relay) forwards ciphertext it cannot read. **The public SOS broadcast is
+still deliberately plaintext** — see the threat-model note below for why. **Not run on a device or
+compiled this session** — this machine has no Gradle/JDK/Android SDK (no cached Gradle like prior
+sessions, no `./gradlew`), so this is code-reviewed only, not `:app:assembleDebug`-verified. Build
+and run this before trusting it; the two crypto/QR dependency groups added below are the most
+likely source of a real build error (version mismatches, ProGuard/R8 rules if minification is ever
+turned on for release — currently off per `app/build.gradle.kts`).
+
+**New — `data/security/CryptoManager.kt`.** Each user gets a long-term X25519 key pair, generated
+by Tink's audited `subtle.X25519`. The scheme is **static X25519 ECDH + HKDF-SHA256 → AES-256-GCM**
+(all three primitives are Tink's `subtle` classes — audited implementations used directly, not
+hand-rolled crypto), *not* Tink's HPKE/ephemeral-key hybrid encryption API: a static per-pair key
+means either side can re-derive it and decrypt their own sent history later, which ephemeral HPKE
+can't do without a second ciphertext copy per message. The derived AES key is cached per peer.
+`encryptFor(peerId, peerPubKeyBase64, plaintext)` / `decryptFrom(peerId, peerPubKeyBase64,
+ciphertext)` are the two entry points; associated data is the deterministic `chatId` so ciphertext
+can't be replayed into a different conversation. `bind(uid)` loads-or-generates the identity on
+login/signup/cold-start; `clear()` drops the in-memory identity on logout (the on-disk keyset is
+untouched, so logging back in as the same user restores the same identity + safety number).
+
+**"Private key in the Keystore", honestly.** Raw X25519 key material cannot be generated/stored
+natively inside the Android Keystore below API 31, and support is inconsistent even above it — this
+app's minSdk is 24. So the private key bytes (from Tink's software X25519 implementation) are
+stored via `androidx.security.crypto.EncryptedSharedPreferences`, whose wrapping AES key is a
+`MasterKey` that **does** live in the Android Keystore (hardware-backed where available,
+non-exportable). This is the standard, portable interpretation of "protected by the Keystore" for
+asymmetric keys down to minSdk 24 — envelope encryption, not native raw-key Keystore residency.
+Documented here instead of silently overclaiming it.
+
+**`Packet.nonce` stays unused, on purpose.** Tink's `AesGcmJce` generates and bundles its own
+random IV inside its ciphertext output, so there's no separate IV to carry in the packet header.
+Using the wrapper's built-in IV handling (rather than pulling IV generation into our own code just
+to populate the header field) avoids a whole class of nonce-reuse bugs for no real benefit.
+
+**New — `data/security/SafetyNumber.kt`.** SHA-256 fingerprint of both users' (uid, pubKey) pairs,
+order-independent — same string on both phones, read-aloud/compare style verification (Signal-style
+"safety number"), for verifying a contact without a shared QR-scanning moment.
+
+**New — `data/security/QrCodec.kt` + `ui/pairing/`.** `PairingScreen` always shows the current
+user's own QR (uid + display name + base64 pubkey, ZXing-encoded to a `Bitmap`) and can switch to a
+scan mode: a CameraX `PreviewView` + `ImageAnalysis` feeding frames directly into ZXing's
+`MultiFormatReader` (no ML Kit — one barcode format, one screen, didn't need the extra dependency).
+A successful scan caches the peer's pubkey and marks them **verified** immediately — the key came
+straight off their device's screen in person, so that scan *is* the verification step; the safety
+number is the fallback for verifying without a shared scan. Entry points: Profile → "My QR Code /
+Verify a Contact" (no peer context — `Routes.Pairing.build()`), and a lock icon in `ChatScreen`'s
+top bar scoped to that conversation's peer (`Routes.Pairing.build(peerUid, peerName)`). New
+`data/local/ContactSecurityStore.kt` (DataStore) persists the local pubkey cache + verified flags,
+keyed by `(myUid, peerUid)` so multiple accounts on one device don't cross-contaminate. Added
+`CAMERA` permission + `android.hardware.camera` (`required="false"`) to the manifest.
+
+**Wired into the send/receive path.** `ChatRepository.sendMessage` now resolves the peer's
+published public key (local cache first — works offline once known, e.g. via QR pairing — else
+`users/{uid}.pubKey` on Firestore), encrypts the text with `CryptoManager.encryptFor`, and puts the
+ciphertext in `Packet.payload`; `InternetTransport.sendTargeted` writes it as a base64 `ciphertext`
+Firestore field (replacing the old plaintext `text` field — no migration needed, there's no real
+user data yet). `ChatRepository.observeMessages(chatId, myUid, peerId)` (signature gained `myUid`/
+`peerId`, needed to resolve the pair's key) resolves the peer's key once per subscription and
+decrypts every message — including the current user's own sent messages, since the shared key is
+symmetric. A message that fails to decrypt (peer's key changed, corrupted data, whatever) renders
+as a placeholder string instead of crashing or dropping the message. **The `chats/{chatId}` summary
+doc's `lastMessage` field is now a static placeholder ("🔒 New message"), not real preview text** —
+that doc is what the Home list preview reads from, and it must stay relay-blind same as the message
+body. Accepted UX regression (Home no longer shows a live snippet); encrypting the summary too and
+decrypting per-row in `observeRecentChats` is a reasonable follow-up if the preview is wanted back.
+
+**Signup/login/cold-start now bind + publish the identity key.** `SignupViewModel.signup()` and
+`LoginViewModel.login()` call `cryptoManager.bind(uid)` then `userRepository.publishPublicKey(uid,
+...)` (best-effort — wrapped in `runCatching`, doesn't block the login/signup flow on a Firestore
+write failure). `MainActivity.onCreate` does the same for a cold start that skips both screens
+(existing session). `ProfileViewModel.logout()` calls `cryptoManager.clear()`. New
+`UserRepository.publishPublicKey(uid, pubKeyBase64)`; `User`/`UserRepository.getUser`/`listUsers`/
+`findByEmail` all gained a `pubKey` field.
+
+**Threat model — what a relay (Firestore, or a future BLE/Wi-Fi-Direct relay hop) can and cannot
+see, for a targeted 1:1 message:**
+- **Cannot see:** message text (AES-256-GCM ciphertext only).
+- **Can see:** `senderId`, `timestamp`, the `chatId` (derived from both uids), message size/timing/
+  frequency (traffic metadata), and the fact that a conversation between two specific uids exists
+  at all (the `chats/{chatId}` doc itself, and its participants list).
+- **Not defended against:** a malicious or compromised Firestore admin swapping a user's published
+  `pubKey` to mount a man-in-the-middle (this is exactly what QR pairing / safety-number comparison
+  is for — an *unverified* contact has no cryptographic guarantee the key came from who they think
+  it did, only that whoever holds the matching private key can read it). No forward secrecy (a
+  single compromised private key decrypts that pair's entire history — static per-pair key, not a
+  ratchet). No deniability/repudiation properties. Metadata (who talks to whom, when, how often) is
+  fully visible to Firestore regardless.
+- **The SOS broadcast stays plaintext by design**, unchanged from prior sessions' decision: it's
+  meant to be read by *everyone* reachable, so there's no single recipient to encrypt it for, and
+  "encrypting" a public broadcast to no one in particular is meaningless.
+
+**Known gaps / left for later:**
+- **Not compiled or run this session** (no Gradle/JDK/SDK on this machine) — build and manually
+  verify signup → login → send/receive a 1:1 message → QR-pair two accounts → safety number matches
+  on both, before trusting this.
+- **No forward secrecy / no ratchet** — static per-pair key, as above. Fine for this project's scope
+  (relay-blindness was the ask), but worth calling out if the paper claims Signal-protocol-level
+  guarantees anywhere.
+- **BLE/Wi-Fi-Direct tiers don't carry encrypted 1:1 traffic yet** — offline 1:1 messaging still
+  doesn't exist at all (unchanged from Session 4's gap list); when it's built, `CryptoManager`
+  already has everything it needs (peer pubkeys can be cached via QR pairing without any network),
+  so encrypting that path should be a straightforward reuse, not new crypto design.
+- **Reinstalling the app (or clearing app data) loses the identity key** and therefore all history
+  encrypted under it — there's no key backup/export/restore UI. A fresh install generates a new
+  identity and overwrites the old `pubKey` on Firestore; anyone who had that user's old key marked
+  verified will see them as unverified again until re-paired. This is the standard trade-off for a
+  device-resident identity key with no backup, not a bug, but undocumented anywhere else — flagging
+  it here since it'll be confusing the first time someone hits it during testing.
+- **Firestore rules/index unchanged** — the existing permissive rules in §7 (`allow read, write: if
+  request.auth != null`) don't need updating for the new field names (`ciphertext` instead of
+  `text`); they were never field-scoped to begin with.
+- New Gradle dependencies this session (`app/build.gradle.kts`): `com.google.crypto.tink:
+  tink-android:1.13.0`, `androidx.security:security-crypto:1.1.0-alpha06`, `com.google.zxing:
+  core:3.5.3`, `androidx.camera:{camera-core,camera-camera2,camera-lifecycle,camera-view}:1.3.1`.
+  None of these were previously in the project — first real dependency-resolution risk since the
+  original Firebase/Compose BOM setup.
+
 ### Session 3 (2026-08-20) — BLE runtime instrumentation + real-device bug fixes
 Branch `feat/ble-runtime-fixes`. Goal: make the offline SOS broadcast actually work phone-to-phone,
 and make every failure visible in logcat instead of silent. **Still no on-device run** — everything
@@ -245,9 +364,10 @@ permission is actually used. All permission handling lives in `EmergencyScreen` 
   10-hop TTL).
 - **UI: full Compose + MVVM**, replacing XML/Activities.
 - **Theme: Light / Dark / Follow-System, persisted in DataStore.**
-- **Encryption intentionally deferred** — an SOS is a public broadcast, so E2E-to-one-recipient is
-  meaningless. If wanted later, it belongs on a *targeted 1:1 BLE message* variant (X25519 +
-  Android Keystore), not the broadcast.
+- **Encryption implemented for targeted 1:1 messages as of Session 5** (X25519 + HKDF + AES-256-GCM,
+  `data/security/CryptoManager.kt`) — Firestore only ever sees ciphertext for 1:1 chat. **The SOS
+  broadcast stays intentionally unencrypted** — it's a public broadcast to everyone reachable, so
+  E2E-to-one-recipient is meaningless; encrypting it would mean nobody could read it.
 
 ---
 
@@ -259,31 +379,38 @@ com.capstone.chatapp/
   ChatApp.kt                   # Application; builds AppContainer (manual DI)
   di/AppContainer.kt           # holds all repositories + BleMeshManager + NetworkMonitor (singletons)
   navigation/
-    Routes.kt                  # login, signup, home, discover, chat/{peerUid}, profile, emergency
+    Routes.kt                  # login, signup, home, discover, chat/{peerUid}, profile, emergency, pairing
     AppNavHost.kt              # NavHost wiring
   ui/
     theme/                     # Color.kt, Type.kt, Theme.kt (Material3 light+dark, ThemeMode enum)
     components/                # AppTextField, LoadingButton, AuthScaffold (shared UX)
     util/     TimeFormat.kt    # formatTime(Long) / formatTime(Timestamp) for message times
-    login/    LoginScreen + LoginViewModel
-    signup/   SignupScreen + SignupViewModel
+    login/    LoginScreen + LoginViewModel      # also binds+publishes the E2E identity key on sign-in
+    signup/   SignupScreen + SignupViewModel    # also binds+publishes the E2E identity key on sign-up
     home/     HomeScreen + HomeViewModel        # conversation list (recent chats) + Discover/Profile/SOS entries
     discover/ DiscoverScreen + DiscoverViewModel  # All Users (Firestore) + Nearby (BLE) tabs
-    chat/     ChatScreen + ChatViewModel        # realtime 1:1, theme-aware bubbles + timestamps
-    profile/  ProfileScreen + ProfileViewModel  # username, theme selector, logout
+    chat/     ChatScreen + ChatViewModel        # realtime 1:1, theme-aware bubbles + timestamps + Verify action
+    profile/  ProfileScreen + ProfileViewModel  # username, theme selector, logout, My QR Code entry
     emergency/ EmergencyScreen + EmergencyViewModel  # SOS broadcast, chat-styled bubbles + persisted history
+    pairing/  PairingScreen + PairingViewModel  # NEW Session 5: QR show/scan + safety-number display
   data/
-    model/        Message.kt, User.kt, ChatSummary.kt
+    model/        Message.kt, User.kt (+ pubKey), ChatSummary.kt
     local/        EmergencyHistoryStore.kt      # DataStore-persisted SOS history (JSON)
-    repository/    AuthRepository, UserRepository (listUsers), ChatRepository (observeMessages +
+                   ContactSecurityStore.kt      # NEW Session 5: cached peer pubkeys + verified flags
+    security/      NEW Session 5 — E2E encryption
+      CryptoManager.kt        # X25519 identity (Keystore-wrapped) + HKDF + AES-256-GCM encrypt/decrypt
+      SafetyNumber.kt         # order-independent fingerprint of two pubkeys, for manual verification
+      QrCodec.kt              # pairing QR payload encode/parse + ZXing bitmap generation
+    repository/    AuthRepository, UserRepository (listUsers, pubKey, publishPublicKey),
+                   ChatRepository (observeMessages now encrypts/decrypts via CryptoManager +
                    observeRecentChats + chat-summary upsert), EmergencyRepository (Firestore
-                   `emergencies`), SettingsRepository (DataStore)
+                   `emergencies`, still plaintext by design), SettingsRepository (DataStore)
     transport/
       Tier.kt                 # enum INTERNET / WIFI_DIRECT / BLE_MESH
       Packet.kt               # transport-agnostic wire format: cleartext header + opaque payload
       Transport.kt            # interface every bearer implements + SendResult enum
-      InternetTransport.kt    # Transport over Firestore (emergencies + chats/{chatId}/messages)
-      WifiDirectTransport.kt  # TODO(Session 5) stub — always UNAVAILABLE
+      InternetTransport.kt    # Transport over Firestore (emergencies plaintext, chats/{chatId}/messages ciphertext)
+      WifiDirectTransport.kt  # TODO(Session 6) stub — always UNAVAILABLE
       NetworkMonitor.kt        # validated-internet flow (online/offline)
       ble/
         BleConstants.kt        # UUIDs, TTL=10, REACH_CAP=100, MTU=185, timeouts/eviction/outbox windows
@@ -317,7 +444,10 @@ manual DI via `AppContainer` (no Hilt).
 - [x] Multi-hop relay (flood + seen-set), shortest-path-wins, ~100 reach cap + 10-hop TTL
 - [x] Dual-send when online (BLE + Firestore `emergencies`), de-dup by `msgId`
 - [x] Online / Offline·BLE status badge + nearby-device count
-- [ ] Encryption — deferred by design (see decisions)
+- [x] E2E encryption for targeted 1:1 messages (X25519 + HKDF + AES-256-GCM) — ⚠ not yet
+      compiled/run on a device this session; SOS broadcast stays unencrypted by design
+- [x] QR pairing + safety-number verification for contacts (`ui/pairing/PairingScreen.kt`)
+- [ ] Offline 1:1 over BLE — still doesn't exist; when it lands, CryptoManager already covers it
 
 **UI / UX (all implemented)**
 - [x] Full Compose + MVVM, single Activity + NavHost
@@ -432,15 +562,22 @@ it has run on a phone.** Follow `docs/RUNTIME_TEST.md` and confirm, in order:
   Emergency Mode, the Nearby tab is silently empty with no explanation. Emergency Mode is the only place
   that requests permissions and starts the service.
 - **No offline 1:1** — tapping a Nearby/Discover person opens the *online* Firestore chat.
-- **Encryption** not implemented (deferred by design; SOS is a public broadcast).
+- **Encryption for 1:1 chat implemented in Session 5** but **not yet built or run on a device** —
+  see the Session 5 changelog above for the full threat model and what's not compiled/verified.
+  SOS broadcast stays unencrypted (deferred by design — it's a public broadcast).
 - **Battery duty-cycling** — the scanner runs in `SCAN_MODE_LOW_LATENCY` continuously, which is heavy.
 - **Simultaneous-GATT-connection limit (~4–7)** is sidestepped by serializing to one connection at a
   time, which is safe but slow with many neighbours; no parallelism or connection pooling.
 - **Message chunking above the MTU** is now handled by Android's long-write path (buffered server-side),
   but there is no application-level fragmentation for genuinely large payloads.
 
-**Recommended next step:** drop in `google-services.json`, build, then run `docs/RUNTIME_TEST.md`
-end to end on two phones and bring back the `SafeSphereBLE` logcat from both.
+**Recommended next step:** drop in `google-services.json`, build (**this session's E2E-encryption
+work has never been compiled — no Gradle/JDK/SDK were available in this environment**, so building
+it for the first time is the actual next step, before the two-phone BLE test below), then run
+`docs/RUNTIME_TEST.md` end to end on two phones and bring back the `SafeSphereBLE` logcat from both.
+Also manually verify the encryption path: sign up two accounts, send a 1:1 message both ways, QR-pair
+them from `Profile → My QR Code / Verify a Contact`, and confirm the safety number matches on both
+phones.
 
 ---
 

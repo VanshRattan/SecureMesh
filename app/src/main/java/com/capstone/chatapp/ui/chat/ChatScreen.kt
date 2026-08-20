@@ -19,6 +19,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -59,6 +60,7 @@ fun ChatScreen(
     peerUid: String,
     peerName: String,
     onBack: () -> Unit,
+    onVerify: () -> Unit,
 ) {
     val container = LocalContext.current.appContainer()
     val vm: ChatViewModel = viewModel(factory = viewModelFactory {
@@ -89,6 +91,11 @@ fun ChatScreen(
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+                    }
+                },
+                actions = {
+                    IconButton(onClick = onVerify) {
+                        Icon(Icons.Filled.Lock, contentDescription = "Verify contact / encryption")
                     }
                 },
             )

@@ -12,6 +12,7 @@ import com.capstone.chatapp.ui.discover.DiscoverScreen
 import com.capstone.chatapp.ui.emergency.EmergencyScreen
 import com.capstone.chatapp.ui.home.HomeScreen
 import com.capstone.chatapp.ui.login.LoginScreen
+import com.capstone.chatapp.ui.pairing.PairingScreen
 import com.capstone.chatapp.ui.profile.ProfileScreen
 import com.capstone.chatapp.ui.signup.SignupScreen
 
@@ -83,6 +84,7 @@ fun AppNavHost(startLoggedIn: Boolean) {
                 peerUid = peerUid,
                 peerName = peerName,
                 onBack = { navController.popBackStack() },
+                onVerify = { navController.navigate(Routes.Pairing.build(peerUid, peerName)) },
             )
         }
 
@@ -94,6 +96,29 @@ fun AppNavHost(startLoggedIn: Boolean) {
                         popUpTo(0) { inclusive = true }
                     }
                 },
+                onOpenPairing = { navController.navigate(Routes.Pairing.build()) },
+            )
+        }
+
+        composable(
+            route = Routes.Pairing.route,
+            arguments = listOf(
+                navArgument(Routes.Pairing.ARG_PEER_UID) {
+                    type = NavType.StringType; nullable = true; defaultValue = null
+                },
+                navArgument(Routes.Pairing.ARG_PEER_NAME) {
+                    type = NavType.StringType; nullable = true; defaultValue = null
+                },
+            ),
+        ) { entry ->
+            val pairPeerUid = entry.arguments?.getString(Routes.Pairing.ARG_PEER_UID)?.takeIf { it.isNotBlank() }
+            val pairPeerName = entry.arguments?.getString(Routes.Pairing.ARG_PEER_NAME)
+                ?.let { Uri.decode(it) }
+                ?.takeIf { it.isNotBlank() }
+            PairingScreen(
+                peerUid = pairPeerUid,
+                peerName = pairPeerName,
+                onBack = { navController.popBackStack() },
             )
         }
     }

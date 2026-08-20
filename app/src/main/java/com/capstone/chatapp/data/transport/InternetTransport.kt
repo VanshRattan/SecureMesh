@@ -1,5 +1,6 @@
 package com.capstone.chatapp.data.transport
 
+import android.util.Base64
 import com.capstone.chatapp.data.model.Message
 import com.capstone.chatapp.data.transport.ble.BlePacket
 import com.google.firebase.Timestamp
@@ -17,11 +18,10 @@ import kotlinx.coroutines.tasks.await
  * [chatId] is derived the same deterministic way both sides already agree on
  * ([Message.getChatId]), so this never needs to be told which chat a targeted packet belongs to.
  *
- * The document fields are unchanged from before this abstraction existed (`senderId`, `text`,
- * `timestamp`, ...) — [Packet.payload] is UTF-8 text today. When end-to-end encryption lands,
- * payload becomes ciphertext and these fields switch to storing it opaquely; Firestore already
- * only ever sees what's in the packet, so relay-blindness is a schema change away, not an
- * architecture change.
+ * Targeted 1:1 packets: [Packet.payload] is AES-256-GCM ciphertext (see
+ * `data/security/CryptoManager.kt`), stored as a base64 `ciphertext` field — Firestore never
+ * sees plaintext for 1:1 messages. Broadcasts stay plaintext by design: an SOS is meant to be
+ * readable by everyone reachable, so there is no single recipient to encrypt it for.
  */
 class InternetTransport(private val firestore: FirebaseFirestore = FirebaseFirestore.getInstance()) : Transport {
 
@@ -81,9 +81,12 @@ class InternetTransport(private val firestore: FirebaseFirestore = FirebaseFires
         val destId = requireNotNull(packet.destId) { "targeted packet missing destId" }
         val srcId = packet.srcId.orEmpty()
         val chatId = Message.getChatId(srcId, destId)
+        // packet.payload is AES-256-GCM ciphertext (see CryptoManager) — Firestore/any relay
+        // only ever sees this opaque blob, never plaintext. Base64 because Firestore string
+        // fields must be valid UTF-16; raw bytes would corrupt on round-trip.
         val data = hashMapOf(
             "senderId" to srcId,
-            "text" to String(packet.payload, Charsets.UTF_8),
+            "ciphertext" to Base64.encodeToString(packet.payload, Base64.NO_WRAP),
             "timestamp" to Timestamp.now(),
         )
         chats.document(chatId).collection("messages").add(data).await()

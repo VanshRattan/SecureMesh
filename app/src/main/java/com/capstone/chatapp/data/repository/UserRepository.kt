@@ -25,6 +25,7 @@ class UserRepository(private val firestore: FirebaseFirestore = FirebaseFirestor
             uid = uid,
             email = doc.getString("email") ?: "",
             username = doc.getString("username") ?: "",
+            pubKey = doc.getString("pubKey") ?: "",
         )
     }
 
@@ -38,6 +39,7 @@ class UserRepository(private val firestore: FirebaseFirestore = FirebaseFirestor
                     uid = doc.id,
                     email = doc.getString("email") ?: "",
                     username = doc.getString("username") ?: "",
+                    pubKey = doc.getString("pubKey") ?: "",
                 )
             }
             .sortedBy { it.displayName.lowercase() }
@@ -51,10 +53,17 @@ class UserRepository(private val firestore: FirebaseFirestore = FirebaseFirestor
             uid = doc.id,
             email = doc.getString("email") ?: "",
             username = doc.getString("username") ?: "",
+            pubKey = doc.getString("pubKey") ?: "",
         )
     }
 
     suspend fun updateUsername(uid: String, username: String) {
         users.document(uid).update("username", username).await()
+    }
+
+    /** Publishes this device's X25519 public key so peers can encrypt to this user. Called at
+     *  signup/login (see CryptoManager) — safe to call repeatedly, it just overwrites the field. */
+    suspend fun publishPublicKey(uid: String, pubKeyBase64: String) {
+        users.document(uid).set(mapOf("pubKey" to pubKeyBase64), com.google.firebase.firestore.SetOptions.merge()).await()
     }
 }

@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.capstone.chatapp.data.repository.AuthRepository
 import com.capstone.chatapp.data.repository.UserRepository
+import com.capstone.chatapp.data.security.CryptoManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,6 +25,7 @@ data class SignupUiState(
 class SignupViewModel(
     private val authRepository: AuthRepository,
     private val userRepository: UserRepository,
+    private val cryptoManager: CryptoManager,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(SignupUiState())
@@ -52,6 +54,8 @@ class SignupViewModel(
             try {
                 val uid = authRepository.signUp(email, password)
                 userRepository.saveUser(uid, email)
+                cryptoManager.bind(uid)
+                runCatching { userRepository.publishPublicKey(uid, cryptoManager.publicKeyBase64()) }
                 _state.update { it.copy(isLoading = false, signedUp = true) }
             } catch (e: Exception) {
                 _state.update { it.copy(isLoading = false, errorMessage = e.message ?: "Sign up failed") }

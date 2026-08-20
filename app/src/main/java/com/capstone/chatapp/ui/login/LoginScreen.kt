@@ -33,7 +33,7 @@ fun LoginScreen(
 ) {
     val container = LocalContext.current.appContainer()
     val vm: LoginViewModel = viewModel(factory = viewModelFactory {
-        initializer { LoginViewModel(container.authRepository) }
+        initializer { LoginViewModel(container.authRepository, container.userRepository, container.cryptoManager) }
     })
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }

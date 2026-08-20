@@ -1,12 +1,14 @@
 package com.capstone.chatapp.di
 
 import android.content.Context
+import com.capstone.chatapp.data.local.ContactSecurityStore
 import com.capstone.chatapp.data.local.EmergencyHistoryStore
 import com.capstone.chatapp.data.repository.AuthRepository
 import com.capstone.chatapp.data.repository.ChatRepository
 import com.capstone.chatapp.data.repository.EmergencyRepository
 import com.capstone.chatapp.data.repository.SettingsRepository
 import com.capstone.chatapp.data.repository.UserRepository
+import com.capstone.chatapp.data.security.CryptoManager
 import com.capstone.chatapp.data.transport.InternetTransport
 import com.capstone.chatapp.data.transport.NetworkMonitor
 import com.capstone.chatapp.data.transport.WifiDirectTransport
@@ -26,6 +28,10 @@ class AppContainer(context: Context) {
     val settingsRepository: SettingsRepository = SettingsRepository(appContext)
     val emergencyHistoryStore: EmergencyHistoryStore = EmergencyHistoryStore(appContext)
 
+    // E2E encryption: identity key pair + local cache of peers' public keys / verified flags.
+    val cryptoManager: CryptoManager = CryptoManager(appContext)
+    val contactSecurityStore: ContactSecurityStore = ContactSecurityStore(appContext)
+
     val networkMonitor: NetworkMonitor = NetworkMonitor(appContext)
     // Singleton so the UI and the foreground service observe/drive the same mesh.
     val bleMeshManager: BleMeshManager = BleMeshManager(appContext)
@@ -33,9 +39,10 @@ class AppContainer(context: Context) {
     // The Transport layer: everything above this talks Packets, never a bearer directly.
     val internetTransport: InternetTransport = InternetTransport()
     val bleTransport: BleTransport = BleTransport(bleMeshManager)
-    val wifiDirectTransport: WifiDirectTransport = WifiDirectTransport() // TODO(Session 5)
+    val wifiDirectTransport: WifiDirectTransport = WifiDirectTransport() // TODO(Session 6)
 
-    val chatRepository: ChatRepository = ChatRepository(internetTransport)
+    val chatRepository: ChatRepository =
+        ChatRepository(internetTransport, userRepository, cryptoManager, contactSecurityStore)
     val emergencyRepository: EmergencyRepository = EmergencyRepository(internetTransport)
 }
 

@@ -47,7 +47,7 @@ class ChatViewModel(
             }
         }
         viewModelScope.launch {
-            chatRepository.observeMessages(chatId)
+            chatRepository.observeMessages(chatId, currentUid, peerUid)
                 .catch { e -> _state.update { it.copy(errorMessage = e.message ?: "Error loading messages") } }
                 .collect { messages -> _state.update { it.copy(messages = messages) } }
         }
