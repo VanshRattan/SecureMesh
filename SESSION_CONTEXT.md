@@ -1,7 +1,7 @@
 # Session Context — Capstone Emergency Chat App
 
 > Snapshot of the work done across sessions. Read this first to pick up where we left off.
-> Last updated: 2026-08-21 (Session 9)
+> Last updated: 2026-08-21 (Session 10)
 
 ---
 
@@ -33,6 +33,110 @@ debug APK** (`app/build/outputs/apk/debug/app-debug.apk`).
 ---
 
 ## 2b. Changelog
+
+### Session 10 (2026-08-21) — evaluation instrumentation (the paper's results-section numbers)
+Branch `feat/eval-instrumentation`, built on top of `feat/full-system-ui`. Goal: CLAUDE.md
+§5.5's last unbuilt item — capture delivery ratio, latency, hop count, per-tier usage and an
+energy-cost estimate, with minimal overhead, off in release builds. **Compiled and verified
+this session**: `:app:compileDebugKotlin` and `:app:assembleDebug` both succeed (throwaway
+placeholder `google-services.json`, deleted after — same workaround as every prior session).
+**Not run on a device** — this is instrumentation layered over transports that themselves
+have never run on a device (Sessions 3–9's gap, still open; see §8) — the numbers this
+produces are not yet real evaluation data, only unverified plumbing for collecting it.
+
+**New package — `data/metrics/`.** `MetricsCollector.kt` is the whole thing: one
+append-only CSV (`Android/data/com.capstone.chatapp/files/metrics/metrics_<timestamp>.csv`
+per app run), one row per event, no in-memory per-message aggregate. Deliberately an event
+log rather than a live aggregate — delivery ratio/latency/hop-count/per-tier-usage are all
+*derived* afterward by joining rows on a hashed msgId (see the new `docs/EVALUATION.md`),
+which costs only an append per event and needs no state that could leak across a long
+session or drift out of sync with retries. **Gated on `BuildConfig.DEBUG`** (new
+`buildFeatures { buildConfig = true }` in `app/build.gradle.kts`, required by AGP 8's
+default-off `BuildConfig` generation) — a release build's `enabled` is always false, so this
+is compiled out of release behavior by construction rather than relying on a runtime toggle.
+**No PII**: every id is unsalted SHA-256, truncated to 16 hex chars, before it touches the
+CSV — unsalted on purpose, so the same id hashes identically across two phones' separate
+CSVs and stays joinable, while nothing readable (a uid, a name) is ever written to disk.
+
+**Wired into the three places that already choke-point every send/receive** — no new
+subscriptions, no touching `BleMeshManager`'s hardened flood internals:
+- **`TransportSendCoordinator`** (`data/transport/TransportSendCoordinator.kt`) — the
+  single place every send already goes through. Records one `SEND_ATTEMPT` row per tier the
+  arbiter actually tried (not just the winner — this is what "tiers used per hop" comes
+  from) and one `SEND_RESULT` row per `send()` call for the overall `SENT`/`QUEUED` outcome.
+  New constructor param `metricsCollector`.
+- **`OfflineMessageRouter`** (`data/repository/OfflineMessageRouter.kt`) — the receive side
+  for targeted (1:1) BLE/Wi-Fi-Direct packets, including the ack `OfflineMessageRouter`
+  already sends back to the original sender (Session 9). Its `merge(bleTransport.incoming,
+  wifiDirectTransport.incoming)` became two separately-tagged `collect`s instead, since a
+  merged flow loses which tier a packet actually arrived over (neither `BlePacket` nor a
+  targeted `Packet`'s own `tierTag` reflects the arbiter's per-hop choice — `tierTag` is set
+  once at packet-creation time and never updated). Records `RECEIVED` for a real message and
+  `ACK_RECEIVED` for a delivery receipt — the latter is what makes 1:1 delivery ratio and
+  latency derivable from **the sender's own CSV alone**, no cross-device join needed (see
+  `docs/EVALUATION.md` §2.2). New constructor param `metricsCollector`.
+- **`EmergencyViewModel.addItem`** (`ui/emergency/EmergencyViewModel.kt`) — the SOS
+  broadcast's single dedup point (`seenIds.add`), fed by both `observeMesh` (BLE) and
+  `observeInternet` (Firestore), each now tagging its call with the tier it came from. The
+  synchronous local echo in `sendSos()` (the sender's own optimistic UI update) deliberately
+  passes no tier, so it's *not* recorded as a network receive — recording it would fabricate
+  a zero-latency delivery of a message to itself.
+
+**Hop count is `BleConstants.DEFAULT_TTL - Packet.ttl`, floored at 0** — computed generically
+off the transport-agnostic `Packet` header (not `BlePacket`'s own explicit `hopCount` field,
+which only exists inside the BLE package and isn't visible through the tier-agnostic
+`Transport.incoming: Flow<Packet>` this hooks into), except `INTERNET` is hard-coded to 0
+(Firestore doesn't decrement a ttl — a delivery there is a direct single hop by construction,
+and `EmergencyRepository`'s Firestore→`BlePacket` mapping hard-codes `ttl=0` as a placeholder
+that would otherwise misread as "10 hops" if fed through the same formula).
+
+**Energy/relay-activity sampling** — `MetricsCollector.start()` also launches a periodic
+(30s) `ENERGY_SAMPLE` row: `EnergyMonitor.batteryFraction()`/`isCharging()` plus
+`BleMeshManager.status.value.neighborCount` and `WifiDirectManager.status.value
+.connectedSockets` as the proxy for "how much relay traffic is this device in range to
+carry" — reusing the same load signals `TransportArbiter`'s congestion scoring already
+depends on, rather than adding new per-packet energy accounting deep inside either mesh
+manager (explicitly out of scope — see `docs/EVALUATION.md` §2.6 for why that's an
+approximation, not precise per-message accounting).
+
+**Debug-only "Export Metrics" action** — `ProfileScreen`/`ProfileViewModel` gained a
+`BuildConfig.DEBUG`-gated "Diagnostics" section (new `ProfileViewModel.exportMetrics()`,
+new constructor param `metricsCollector`) that flushes the CSV writer and shows its absolute
+path in a snackbar; pull it with `adb pull` or a file manager. No `FileProvider`/share-sheet
+wiring added — kept to the minimal surface, since a debug-only file path reachable via adb
+was enough for this task and avoids a new manifest `<provider>` entry.
+
+**New — `docs/EVALUATION.md`.** Full CSV column reference, the exact derivation for each of
+delivery ratio / latency / hop count / per-tier usage / handover time / energy cost (§2), and
+the three scenarios CLAUDE.md §5.5 asks for — dead-internet (airplane mode, forces
+`BLE_MESH`/`WIFI_DIRECT`), congested venue (≥5 phones in BLE range, stresses the concurrency
+cap + retry backoff from Session 6), and censored (internet reachable at the OS level but
+Firestore's endpoints specifically blocked — a firewalled network or captive portal) — each
+with what CSV rows to expect and how to read them (§3). Honestly flags the one real gap this
+surfaced: `TransportArbiter` has no way to detect "online but Firestore specifically is
+blocked" *before* attempting a send, only after a `SEND_ATTEMPT` comes back `FAILED` — a
+tighter arbiter probe is future work, not something this pass changed.
+
+**`di/AppContainer.kt` wiring:** new `metricsCollector` (constructed right after
+`energyMonitor`, before `transportArbiter`, since `transportSendCoordinator` needs it),
+`.also { it.start(appScope) }` same lifecycle pattern as every other app-scoped singleton.
+`transportSendCoordinator` and `offlineMessageRouter` both gained the new constructor param.
+
+**Not done / left for later:**
+- **Not run on a device.** Every event this session added is unverified plumbing until a real
+  two/three-phone run produces an actual CSV to look at — the next step is literally
+  `docs/EVALUATION.md` §3's three scenarios, on real hardware.
+- **No per-relay-hop energy accounting** — the periodic battery/neighbor-count sample is a
+  session-level proxy, not attributable to any single relayed message (§2.6, documented
+  honestly rather than overclaiming precision).
+- **Broadcast (SOS) delivery ratio/latency need a cross-device CSV join** — unlike targeted
+  1:1 messages (self-contained on the sender's own CSV via the ack), there's no ack for a
+  public broadcast, so this direction needs pooling every test phone's CSV and joining on
+  `msgIdHash` by hand (or a small script) after a run — not automated in-app, since a device
+  fundamentally cannot know who else received its own broadcast without that join.
+- **No arbiter-level "Firestore specifically is blocked" probe** — the censored scenario
+  currently detects this the same way the CSV analysis does, after the fact via a failed
+  `SEND_ATTEMPT`, not proactively. Flagged in `docs/EVALUATION.md` §3.3, not fixed.
 
 ### Session 9 (2026-08-21) — full-system UI: transport indicator, verified badges, offline 1:1, delivery states
 Branch `feat/full-system-ui`, built on top of `feat/transport-arbiter`. Goal: surface the

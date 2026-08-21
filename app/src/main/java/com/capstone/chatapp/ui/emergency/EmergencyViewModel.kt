@@ -66,6 +66,7 @@ class EmergencyViewModel(app: Application) : AndroidViewModel(app) {
 
     private val container = app.appContainer()
     private val mesh = container.bleMeshManager
+    private val metricsCollector = container.metricsCollector
 
     private val selfId: String = container.authRepository.currentUid.orEmpty()
     private var selfName: String = container.authRepository.currentEmail?.substringBefore('@') ?: "Someone"
@@ -118,7 +119,7 @@ class EmergencyViewModel(app: Application) : AndroidViewModel(app) {
 
     private fun observeMesh() {
         viewModelScope.launch {
-            mesh.incoming.collect { packet -> addItem(packet, mine = packet.senderId == selfId) }
+            mesh.incoming.collect { packet -> addItem(packet, mine = packet.senderId == selfId, tier = Tier.BLE_MESH) }
         }
         viewModelScope.launch {
             mesh.status.collect { status ->
@@ -138,7 +139,7 @@ class EmergencyViewModel(app: Application) : AndroidViewModel(app) {
     private fun observeInternet() {
         viewModelScope.launch {
             container.emergencyRepository.observeEmergencies().collect { packets ->
-                packets.forEach { addItem(it, mine = it.senderId == selfId) }
+                packets.forEach { addItem(it, mine = it.senderId == selfId, tier = Tier.INTERNET) }
             }
         }
     }
@@ -275,8 +276,13 @@ class EmergencyViewModel(app: Application) : AndroidViewModel(app) {
 
     fun consumeMessage() = _state.update { it.copy(message = null) }
 
-    private fun addItem(packet: BlePacket, mine: Boolean) {
+    private fun addItem(packet: BlePacket, mine: Boolean, tier: Tier? = null) {
         if (!seenIds.add(packet.msgId)) return
+        // tier is only passed by the network-observing collectors (observeMesh/
+        // observeInternet); the synchronous local echo in sendSos passes none, since that
+        // call is this device's own optimistic UI update, not a network arrival -- recording
+        // it would fabricate a zero-latency "delivery" of a message to itself.
+        tier?.let { metricsCollector.recordReceive(packet.toPacket(), it) }
         val item = EmergencyItem(
             msgId = packet.msgId,
             senderName = if (mine) "You" else packet.senderName.ifBlank { "Someone" },

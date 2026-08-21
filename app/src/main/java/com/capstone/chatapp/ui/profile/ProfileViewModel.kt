@@ -2,6 +2,7 @@ package com.capstone.chatapp.ui.profile
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.capstone.chatapp.data.metrics.MetricsCollector
 import com.capstone.chatapp.data.repository.AuthRepository
 import com.capstone.chatapp.data.repository.SettingsRepository
 import com.capstone.chatapp.data.repository.UserRepository
@@ -31,6 +32,7 @@ class ProfileViewModel(
     private val userRepository: UserRepository,
     private val settingsRepository: SettingsRepository,
     private val cryptoManager: CryptoManager,
+    private val metricsCollector: MetricsCollector,
 ) : ViewModel() {
 
     private val _state = MutableStateFlow(ProfileUiState())
@@ -90,6 +92,15 @@ class ProfileViewModel(
             } catch (e: Exception) {
                 _state.update { it.copy(isSaving = false, message = "Failed to update username") }
             }
+        }
+    }
+
+    /** Debug-only "Export metrics" action (see [MetricsCollector]) -- flushes the buffered
+     * CSV rows and surfaces the file's path so it can be pulled with adb or a file manager. */
+    fun exportMetrics() {
+        val path = metricsCollector.exportPath()
+        _state.update {
+            it.copy(message = path?.let { p -> "Metrics saved to $p" } ?: "Metrics are only recorded in debug builds")
         }
     }
 

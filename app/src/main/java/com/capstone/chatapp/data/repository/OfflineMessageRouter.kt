@@ -1,6 +1,7 @@
 package com.capstone.chatapp.data.repository
 
 import com.capstone.chatapp.data.local.OfflineMessageStore
+import com.capstone.chatapp.data.metrics.MetricsCollector
 import com.capstone.chatapp.data.model.DeliveryState
 import com.capstone.chatapp.data.model.Message
 import com.capstone.chatapp.data.security.CryptoManager
@@ -11,7 +12,6 @@ import com.capstone.chatapp.data.transport.Transport
 import com.capstone.chatapp.data.transport.TransportSendCoordinator
 import com.google.firebase.Timestamp
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.flow.merge
 import kotlinx.coroutines.launch
 
 private const val ACK_TTL = 10
@@ -37,17 +37,19 @@ class OfflineMessageRouter(
     private val cryptoManager: CryptoManager,
     private val peerKeyResolver: PeerKeyResolver,
     private val offlineMessageStore: OfflineMessageStore,
+    private val metricsCollector: MetricsCollector,
 ) {
 
     fun start(scope: CoroutineScope) {
-        scope.launch {
-            merge(bleTransport.incoming, wifiDirectTransport.incoming).collect { packet ->
-                runCatching { handlePacket(packet) }
-            }
-        }
+        // Collected as two separately-tagged flows (rather than merge()) so every packet
+        // carries the tier it actually arrived over for MetricsCollector -- a merged flow
+        // would lose that, since neither BlePacket nor a targeted Packet's own tierTag
+        // reflects which bearer the arbiter picked for this particular hop.
+        scope.launch { bleTransport.incoming.collect { packet -> runCatching { handlePacket(packet, Tier.BLE_MESH) } } }
+        scope.launch { wifiDirectTransport.incoming.collect { packet -> runCatching { handlePacket(packet, Tier.WIFI_DIRECT) } } }
     }
 
-    private suspend fun handlePacket(packet: Packet) {
+    private suspend fun handlePacket(packet: Packet, tier: Tier) {
         val myUid = authRepository.currentUid ?: return
         val destId = packet.destId ?: return // broadcasts (the SOS) aren't this router's concern
         if (destId != myUid) return // not addressed to this device -- just a relay hop
@@ -55,6 +57,7 @@ class OfflineMessageRouter(
         val chatId = Message.getChatId(myUid, srcId)
 
         if (packet.ack) {
+            metricsCollector.recordReceive(packet, tier)
             offlineMessageStore.updateState(chatId, packet.msgId, DeliveryState.DELIVERED)
             return
         }
@@ -64,6 +67,7 @@ class OfflineMessageRouter(
             String(cryptoManager.decryptFrom(srcId, peerPubKey, packet.payload), Charsets.UTF_8)
         }.getOrNull() ?: return
 
+        metricsCollector.recordReceive(packet, tier)
         offlineMessageStore.append(chatId, Message(packet.msgId, srcId, text, Timestamp.now(), DeliveryState.DELIVERED))
 
         val ack = Packet(

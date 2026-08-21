@@ -5,6 +5,7 @@ import com.capstone.chatapp.data.local.ContactSecurityStore
 import com.capstone.chatapp.data.local.EmergencyHistoryStore
 import com.capstone.chatapp.data.local.OfflineMessageStore
 import com.capstone.chatapp.data.local.StoreCarryForwardStore
+import com.capstone.chatapp.data.metrics.MetricsCollector
 import com.capstone.chatapp.data.repository.AuthRepository
 import com.capstone.chatapp.data.repository.ChatRepository
 import com.capstone.chatapp.data.repository.EmergencyRepository
@@ -63,6 +64,13 @@ class AppContainer(context: Context) {
     // Per-hop arbiter + reliable-delivery pipeline: repositories/ViewModels no longer pick a
     // tier themselves, they hand a Packet to transportSendCoordinator and it decides.
     val energyMonitor: EnergyMonitor = EnergyMonitor(appContext)
+
+    // Evaluation instrumentation (CLAUDE.md §5.5): compiled in everywhere, but a no-op in a
+    // release build (see MetricsCollector's own doc comment for why BuildConfig.DEBUG rather
+    // than a runtime toggle).
+    val metricsCollector: MetricsCollector =
+        MetricsCollector(appContext, energyMonitor, bleMeshManager, wifiDirectManager).also { it.start(appScope) }
+
     val transportArbiter: TransportArbiter =
         TransportArbiter(bleMeshManager, wifiDirectManager, networkMonitor, energyMonitor)
     val storeCarryForwardStore: StoreCarryForwardStore = StoreCarryForwardStore(appContext)
@@ -75,6 +83,7 @@ class AppContainer(context: Context) {
             Tier.BLE_MESH to bleTransport,
         ),
         storeCarryForwardQueue,
+        metricsCollector,
     ).also { it.start(appScope) }
 
     val peerKeyResolver: PeerKeyResolver = PeerKeyResolver(userRepository, contactSecurityStore)
@@ -95,6 +104,7 @@ class AppContainer(context: Context) {
         cryptoManager,
         peerKeyResolver,
         offlineMessageStore,
+        metricsCollector,
     ).also { it.start(appScope) }
 }
 

@@ -1,5 +1,6 @@
 package com.capstone.chatapp.data.transport
 
+import com.capstone.chatapp.data.metrics.MetricsCollector
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,6 +18,7 @@ class TransportSendCoordinator(
     private val arbiter: TransportArbiter,
     private val transports: Map<Tier, Transport>,
     private val storeCarryForwardQueue: StoreCarryForwardQueue,
+    private val metricsCollector: MetricsCollector,
 ) {
 
     private val _activeTier = MutableStateFlow<Tier?>(null)
@@ -48,7 +50,9 @@ class TransportSendCoordinator(
     suspend fun send(packet: Packet): SendResult {
         val result = attemptSend(packet)
         if (result != SendResult.SENT) storeCarryForwardQueue.enqueue(packet)
-        return if (result == SendResult.SENT) SendResult.SENT else SendResult.QUEUED
+        val outcome = if (result == SendResult.SENT) SendResult.SENT else SendResult.QUEUED
+        metricsCollector.recordSendResult(packet, outcome)
+        return outcome
     }
 
     private suspend fun retryPending() {
@@ -71,6 +75,7 @@ class TransportSendCoordinator(
         for (candidate in candidates) {
             val transport = transports[candidate.tier] ?: continue
             val result = transport.sendToNextHop(packet, nextHop = packet.destId, tier = candidate.tier)
+            metricsCollector.recordSendAttempt(packet, candidate.tier, result)
             if (result == SendResult.SENT) {
                 _activeTier.value = candidate.tier
                 return SendResult.SENT
@@ -88,6 +93,7 @@ class TransportSendCoordinator(
         for (candidate in candidates) {
             val transport = transports[candidate.tier] ?: continue
             val result = transport.sendToNextHop(packet, nextHop = null, tier = candidate.tier)
+            metricsCollector.recordSendAttempt(packet, candidate.tier, result)
             if (result == SendResult.SENT) {
                 anySent = true
                 _activeTier.value = candidate.tier

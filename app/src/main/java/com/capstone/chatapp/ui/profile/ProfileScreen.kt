@@ -43,6 +43,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.capstone.chatapp.BuildConfig
 import com.capstone.chatapp.di.appContainer
 import com.capstone.chatapp.ui.components.AppTextField
 import com.capstone.chatapp.ui.components.LoadingButton
@@ -63,6 +64,7 @@ fun ProfileScreen(
                 container.userRepository,
                 container.settingsRepository,
                 container.cryptoManager,
+                container.metricsCollector,
             )
         }
     })
@@ -156,6 +158,24 @@ fun ProfileScreen(
                 modifier = Modifier.fillMaxWidth().height(56.dp),
             ) {
                 Text("My QR Code / Verify a Contact", style = MaterialTheme.typography.labelLarge)
+            }
+
+            if (BuildConfig.DEBUG) {
+                Spacer(Modifier.height(4.dp))
+                Text("Diagnostics", style = MaterialTheme.typography.titleLarge)
+                Text(
+                    "Debug builds log delivery, latency, hop-count and per-tier metrics for " +
+                        "the evaluation write-up (see docs/EVALUATION.md). Export flushes the " +
+                        "session's CSV and shows its path; pull it with adb or a file manager.",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                OutlinedButton(
+                    onClick = vm::exportMetrics,
+                    modifier = Modifier.fillMaxWidth().height(56.dp),
+                ) {
+                    Text("Export Metrics (Debug)", style = MaterialTheme.typography.labelLarge)
+                }
             }
 
             Spacer(Modifier.height(12.dp))
