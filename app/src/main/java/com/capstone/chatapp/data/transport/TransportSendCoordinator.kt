@@ -25,6 +25,10 @@ class TransportSendCoordinator(
      * traffic is actually moving over, not just a raw "online" vs "offline" flag. */
     val activeTier: StateFlow<Tier?> = _activeTier.asStateFlow()
 
+    /** How many packets are stuck in store-carry-forward right now -- the status UI's
+     * "buffering" signal, alongside [activeTier]. */
+    val bufferedCount: StateFlow<Int> = storeCarryForwardQueue.pendingCount
+
     /** Starts the background retry tick + active-tier tracking. Call once, from a scope
      * that outlives individual screens (see `di/AppContainer.kt`). */
     fun start(scope: CoroutineScope) {

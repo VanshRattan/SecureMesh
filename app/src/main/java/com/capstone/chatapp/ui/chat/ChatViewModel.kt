@@ -2,11 +2,14 @@ package com.capstone.chatapp.ui.chat
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.capstone.chatapp.data.local.ContactSecurityStore
 import com.capstone.chatapp.data.model.Message
 import com.capstone.chatapp.data.repository.AuthRepository
 import com.capstone.chatapp.data.repository.ChatRepository
 import com.capstone.chatapp.data.repository.UserRepository
 import com.capstone.chatapp.data.transport.SendResult
+import com.capstone.chatapp.data.transport.Tier
+import com.capstone.chatapp.data.transport.TransportSendCoordinator
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -18,16 +21,24 @@ data class ChatUiState(
     val messages: List<Message> = emptyList(),
     val isSending: Boolean = false,
     val errorMessage: String? = null,
+    val verified: Boolean = false,
+    val activeTier: Tier? = null,
+    val bufferedCount: Int = 0,
 )
 
 /**
  * Observes and sends messages for the 1:1 chat between the current user and [peerUid].
- * chatId is deterministic (see [Message.getChatId]) so both users share one thread.
+ * chatId is deterministic (see [Message.getChatId]) so both users share one thread. Backed by
+ * [ChatRepository], which now transparently merges Firestore (online) history with any
+ * offline (BLE/Wi-Fi Direct) messages for the same thread — this screen works the same way
+ * whether the peer was opened from Discover's online directory or its Nearby (BLE) tab.
  */
 class ChatViewModel(
     private val chatRepository: ChatRepository,
     authRepository: AuthRepository,
     userRepository: UserRepository,
+    transportSendCoordinator: TransportSendCoordinator,
+    contactSecurityStore: ContactSecurityStore,
     private val peerUid: String,
     private val peerName: String,
 ) : ViewModel() {
@@ -51,6 +62,17 @@ class ChatViewModel(
             chatRepository.observeMessages(chatId, currentUid, peerUid)
                 .catch { e -> _state.update { it.copy(errorMessage = e.message ?: "Error loading messages") } }
                 .collect { messages -> _state.update { it.copy(messages = messages) } }
+        }
+        viewModelScope.launch {
+            contactSecurityStore.isVerified(currentUid, peerUid).collect { verified ->
+                _state.update { it.copy(verified = verified) }
+            }
+        }
+        viewModelScope.launch {
+            transportSendCoordinator.activeTier.collect { tier -> _state.update { it.copy(activeTier = tier) } }
+        }
+        viewModelScope.launch {
+            transportSendCoordinator.bufferedCount.collect { count -> _state.update { it.copy(bufferedCount = count) } }
         }
     }
 

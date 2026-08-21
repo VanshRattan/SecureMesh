@@ -22,8 +22,6 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
-import androidx.compose.material3.AssistChip
-import androidx.compose.material3.AssistChipDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -54,9 +52,9 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.capstone.chatapp.data.transport.Tier
 import com.capstone.chatapp.data.transport.ble.BlePermissions
 import com.capstone.chatapp.ui.components.LoadingButton
+import com.capstone.chatapp.ui.components.TransportStatusChip
 import com.capstone.chatapp.ui.util.formatTime
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -142,7 +140,13 @@ fun EmergencyScreen(onBack: () -> Unit) {
                     }
                 },
                 actions = {
-                    StatusBadge(activeTier = state.activeTier, online = state.online, neighbors = state.neighborCount)
+                    TransportStatusChip(
+                        activeTier = state.activeTier,
+                        online = state.online,
+                        bufferedCount = state.bufferedCount,
+                        neighbors = state.neighborCount,
+                        modifier = Modifier.padding(end = 8.dp),
+                    )
                 },
             )
         },
@@ -185,30 +189,6 @@ fun EmergencyScreen(onBack: () -> Unit) {
             )
         }
     }
-}
-
-/** The arbiter's currently-active tier is the source of truth for this badge; the old
- * plain online/offline flag is only a fallback for the moment before the first reading
- * arrives. */
-@Composable
-private fun StatusBadge(activeTier: Tier?, online: Boolean, neighbors: Int) {
-    val label = when (activeTier) {
-        Tier.INTERNET -> "Internet"
-        Tier.WIFI_DIRECT -> "Wi-Fi Direct"
-        Tier.BLE_MESH -> "Offline · BLE"
-        null -> if (online) "Online" else "Offline · BLE"
-    }
-    val color = if (activeTier == Tier.INTERNET || (activeTier == null && online)) {
-        MaterialTheme.colorScheme.primary
-    } else {
-        MaterialTheme.colorScheme.error
-    }
-    AssistChip(
-        onClick = {},
-        label = { Text(if (neighbors > 0) "$label · $neighbors near" else label) },
-        colors = AssistChipDefaults.assistChipColors(labelColor = color),
-        modifier = Modifier.padding(end = 8.dp),
-    )
 }
 
 /**

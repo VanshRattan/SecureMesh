@@ -3,10 +3,13 @@ package com.capstone.chatapp.di
 import android.content.Context
 import com.capstone.chatapp.data.local.ContactSecurityStore
 import com.capstone.chatapp.data.local.EmergencyHistoryStore
+import com.capstone.chatapp.data.local.OfflineMessageStore
 import com.capstone.chatapp.data.local.StoreCarryForwardStore
 import com.capstone.chatapp.data.repository.AuthRepository
 import com.capstone.chatapp.data.repository.ChatRepository
 import com.capstone.chatapp.data.repository.EmergencyRepository
+import com.capstone.chatapp.data.repository.OfflineMessageRouter
+import com.capstone.chatapp.data.repository.PeerKeyResolver
 import com.capstone.chatapp.data.repository.SettingsRepository
 import com.capstone.chatapp.data.repository.UserRepository
 import com.capstone.chatapp.data.security.CryptoManager
@@ -74,9 +77,25 @@ class AppContainer(context: Context) {
         storeCarryForwardQueue,
     ).also { it.start(appScope) }
 
+    val peerKeyResolver: PeerKeyResolver = PeerKeyResolver(userRepository, contactSecurityStore)
+    val offlineMessageStore: OfflineMessageStore = OfflineMessageStore(appContext)
+
     val chatRepository: ChatRepository =
-        ChatRepository(transportSendCoordinator, userRepository, cryptoManager, contactSecurityStore)
+        ChatRepository(transportSendCoordinator, peerKeyResolver, cryptoManager, offlineMessageStore)
     val emergencyRepository: EmergencyRepository = EmergencyRepository()
+
+    // Receive half of offline 1:1 messaging: decrypts targeted packets that arrive over BLE/
+    // Wi-Fi Direct, persists them, and ACKs the sender. App-scoped so it runs regardless of
+    // which screen (if any) is open, same as transportSendCoordinator above.
+    val offlineMessageRouter: OfflineMessageRouter = OfflineMessageRouter(
+        authRepository,
+        bleTransport,
+        wifiDirectTransport,
+        transportSendCoordinator,
+        cryptoManager,
+        peerKeyResolver,
+        offlineMessageStore,
+    ).also { it.start(appScope) }
 }
 
 /** Convenience accessor from any Context. */

@@ -59,18 +59,19 @@ class TransportArbiter(
     )
 
     /**
-     * Ranks tiers for [packet]. A targeted (1:1) packet is restricted to [Tier.INTERNET]:
-     * BLE/Wi-Fi Direct can carry the bytes, but nothing on the receiving side consumes a
-     * targeted packet off either transport yet (no offline 1:1 -- see CLAUDE.md §6), so
-     * recommending them here would report a send as successful for a message the recipient's
-     * app can never actually surface. Broadcasts ([Packet.destId] == null, i.e. the SOS) are
+     * Ranks every reachable tier for [packet]. Targeted (1:1) packets are free to use any
+     * tier now that `OfflineMessageRouter` consumes them off BLE/Wi-Fi Direct too (offline
+     * 1:1 messaging) -- [BleTransport] carries a targeted packet as an opaque flood payload
+     * ([com.capstone.chatapp.data.transport.ble.BleTransport.sendToNextHop]) and
+     * [com.capstone.chatapp.data.transport.wifidirect.WifiDirectTransport] already carries a
+     * [Packet] generically. Broadcasts ([Packet.destId] == null, i.e. the SOS) are likewise
      * free to use any reachable tier, and [TransportSendCoordinator] fans a broadcast out to
      * every one of them rather than stopping at the first, since each bearer physically
-     * reaches a different audience.
+     * reaches a different audience; a targeted packet still stops at the first tier that
+     * accepts it, since there is exactly one intended recipient.
      */
     fun selectBearer(packet: Packet): ArbiterDecision {
-        val eligible = if (packet.destId != null) listOf(Tier.INTERNET) else Tier.entries.toList()
-        val candidates = eligible.mapNotNull { scoreTier(it, packet.priority) }
+        val candidates = Tier.entries.mapNotNull { scoreTier(it, packet.priority) }
             .sortedByDescending { it.score }
         return if (candidates.isEmpty()) ArbiterDecision.StoreCarry else ArbiterDecision.Candidates(candidates)
     }

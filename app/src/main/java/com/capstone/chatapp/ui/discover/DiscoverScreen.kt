@@ -43,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.capstone.chatapp.data.model.User
+import com.capstone.chatapp.ui.components.VerifiedBadge
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -115,6 +116,7 @@ private fun AllUsersTab(
                             PersonRow(
                                 name = user.displayName,
                                 subtitle = user.email,
+                                verified = state.verifiedUids.contains(user.uid),
                                 onClick = { onOpenChat(user.uid, user.displayName) },
                             )
                         }
@@ -133,7 +135,8 @@ private fun NearbyTab(state: DiscoverUiState, onOpenChat: (String, String) -> Un
                 items(state.nearby, key = { it.uid }) { peer ->
                     PersonRow(
                         name = peer.name,
-                        subtitle = "Near you · Bluetooth",
+                        subtitle = "Near you · Bluetooth · offline chat",
+                        verified = state.verifiedUids.contains(peer.uid),
                         onClick = { onOpenChat(peer.uid, peer.name) },
                     )
                 }
@@ -155,7 +158,7 @@ private fun NearbyTab(state: DiscoverUiState, onOpenChat: (String, String) -> Un
 }
 
 @Composable
-private fun PersonRow(name: String, subtitle: String, onClick: () -> Unit) {
+private fun PersonRow(name: String, subtitle: String, verified: Boolean = false, onClick: () -> Unit) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -174,13 +177,16 @@ private fun PersonRow(name: String, subtitle: String, onClick: () -> Unit) {
             }
         }
         Column(Modifier.weight(1f)) {
-            Text(
-                name,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    name,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                VerifiedBadge(verified = verified)
+            }
             Text(
                 subtitle,
                 style = MaterialTheme.typography.bodyMedium,

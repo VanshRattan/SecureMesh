@@ -1,7 +1,7 @@
 # Session Context — Capstone Emergency Chat App
 
 > Snapshot of the work done across sessions. Read this first to pick up where we left off.
-> Last updated: 2026-08-21 (Session 8)
+> Last updated: 2026-08-21 (Session 9)
 
 ---
 
@@ -33,6 +33,124 @@ debug APK** (`app/build/outputs/apk/debug/app-debug.apk`).
 ---
 
 ## 2b. Changelog
+
+### Session 9 (2026-08-21) — full-system UI: transport indicator, verified badges, offline 1:1, delivery states
+Branch `feat/full-system-ui`, built on top of `feat/transport-arbiter`. Goal: surface the
+three-tier encrypted system in the UI, and close the two biggest gaps every prior session
+flagged — no offline 1:1 messaging, no live transport indicator outside Emergency Mode.
+**Compiled and verified this session**: `:app:compileDebugKotlin` and `:app:assembleDebug`
+both succeed (JBR 17 + cached Gradle 8.5, throwaway placeholder `google-services.json` used
+to verify and then deleted — same workaround as every prior session). **Not run on a
+device** — this still inherits every on-device gap Sessions 3–8 left open (see §8);
+everything below is code-reviewed + compile-verified only.
+
+**Offline 1:1 messaging now exists — the headline gap from every prior session's list.**
+`TransportArbiter.selectBearer` no longer hard-restricts targeted (1:1) packets to
+`Tier.INTERNET`; all three tiers are now scored for a targeted packet the same as a broadcast
+(`TransportArbiter.kt`). Two things had to be true for that restriction to come off safely:
+
+- **`BleTransport` can now carry a targeted packet at all.** `BleMeshManager`'s flood/relay/
+  dedup/outbox/chunking machinery only understands `BlePacket` (its `text` field is a '|'-joined
+  SOS shape); a targeted `Packet`'s payload is opaque ciphertext, not that shape. Rather than
+  touching any of that machinery (deliberately avoided — it's the most hardened, still-never-
+  run-on-device code in the app), `BleTransport.sendToNextHop` now wraps a targeted packet's
+  full serialized bytes (base64, which has no '|' in its alphabet) as the `text` field of a
+  carrier `BlePacket`, and `BleTransport.incoming` unwraps it back on the other end
+  (`wrapTargeted`/`unwrapTargeted`). Every relay hop still only ever sees an opaque carrier —
+  relay-blindness holds — and the message rides the *existing* multi-hop flood for free, not
+  just single-hop to a phone already in direct range. `WifiDirectTransport` needed **no
+  changes at all**: it already carried a generic `Packet` end-to-end (Session 7).
+- **Something has to consume a targeted packet arriving off BLE/Wi-Fi Direct.** New —
+  **`data/repository/OfflineMessageRouter.kt`**: app-scoped (started from `AppContainer` with
+  `appScope`, same lifetime as `TransportSendCoordinator`), merges
+  `bleTransport.incoming`/`wifiDirectTransport.incoming`, and for any packet addressed to this
+  device (`destId == myUid`) that isn't itself a delivery receipt: decrypts it (`CryptoManager`,
+  via the peer's cached/fetched pubkey), appends it to the new **`data/local/
+  OfflineMessageStore.kt`** (DataStore JSON per chatId, same pattern as `EmergencyHistoryStore`),
+  and sends a `Packet.ack = true` receipt back to the sender. An incoming ack just bumps the
+  matching locally-stored message's `DeliveryState` to `DELIVERED`.
+
+**`Packet` gained an `ack: Boolean` field (wire version bumped 1 → 2).** `serialize()` always
+writes it now; `deserialize()` only reads it when `version >= 2`, so the format stays honestly
+versioned rather than silently assuming every packet has it. An ack's own `payload` is empty —
+it proves arrival, not content, so relaying it blind is harmless.
+
+**`ChatRepository` rewritten to merge online + offline history by msgId.** `observeMessages`
+now `combine`s the existing Firestore snapshot flow with `OfflineMessageStore.observe(chatId)`
+and de-dupes by `msgId`, keeping whichever copy has the more advanced `DeliveryState` (a message
+that went out over BLE and *also* shows up on Firestore later keeps the Firestore-implied
+`DELIVERED`). `InternetTransport.sendTargeted` now writes to `.document(packet.msgId)` instead
+of Firestore's auto-generated `.add()` id, specifically so the two copies can collide on msgId.
+`sendMessage` writes an **optimistic local echo** to `OfflineMessageStore` before attempting the
+send (essential for BLE/Wi-Fi Direct, which have no Firestore snapshot to fall back on for the
+sender's own copy) and updates its state after: `DELIVERED` if the arbiter picked
+`Tier.INTERNET`, else `SENT` (upgraded to `DELIVERED` later if/when an ack arrives). New
+**`data/repository/PeerKeyResolver.kt`** factors the peer-pubkey cache/fetch logic out of
+`ChatRepository` so `OfflineMessageRouter` reuses the exact same resolution/caching instead of a
+second copy of security-sensitive logic.
+
+**Known simplification, called out honestly:** delivery state is derived at send time, not
+tracked live through `TransportSendCoordinator`'s background retry tick — a message that starts
+`QUEUED` and is later silently retried-and-sent by the coordinator's `availabilityChanges`
+collector stays shown as "Queued" until an ack arrives (then jumps straight to "Delivered",
+skipping "Sent"). Acceptable for this scope; a full fix would need the coordinator to expose a
+per-message outcome callback, which didn't seem worth the coupling for a demo-scale app.
+**Also:** a targeted send to a peer whose pubkey was never cached (no prior online contact, no
+QR pairing) still throws "This contact hasn't set up encryption yet" even if they're right next
+to you over BLE — this is intentional, not a gap: there's no unauthenticated key exchange over
+Nearby, QR pairing (Session 5) is the out-of-band step SafeSphere already has for exactly this.
+
+**Live transport indicator, everywhere.** New **`ui/components/TransportStatusChip.kt`**
+(Internet / Wi-Fi Direct / Offline·BLE / buffering, reading `TransportSendCoordinator.
+activeTier` + the new `bufferedCount`) replaces Emergency's bespoke inline `StatusBadge` and is
+now also shown in Home's top bar and Chat's top bar — the same source of truth on every screen,
+so the badge can't drift out of sync with what actually sent a message. `StoreCarryForwardQueue`
+gained a `pendingCount: StateFlow<Int>` (updated on every enqueue/remove/load), exposed as
+`TransportSendCoordinator.bufferedCount` — the "buffering" state the task asked for.
+
+**Verified badges everywhere a contact's name appears.** New **`ui/components/
+VerifiedBadge.kt`** (a check for verified, a quiet warning glyph otherwise) plus
+`ContactSecurityStore.verifiedPeerUids(myUid): Flow<Set<String>>` (maps the whole DataStore
+Preferences set rather than one Flow per row) now show on: Home's chat rows (`ChatSummary`
+gained a `verified` field, populated by combining `observeRecentChats` with
+`verifiedPeerUids`), Discover's All-Users and Nearby rows (`DiscoverUiState.verifiedUids`), and
+the Chat top bar next to the peer's name (`ChatViewModel` now also collects
+`ContactSecurityStore.isVerified`).
+
+**Per-message delivery ticks in Chat.** `Message` gained `msgId` and a `state: DeliveryState`
+(`QUEUED`/`SENT`/`DELIVERED`) field. `ChatScreen`'s own-message bubbles now show a text label
+("Queued" / "Sent" / "Delivered ✓✓") next to the timestamp — text, not an icon, to avoid any
+Material-icon-availability risk and to stay consistent with the app's existing text-forward,
+elder-friendly bubble style. Received messages don't show a tick (delivery state is only
+meaningful for the sender's own outgoing messages).
+
+**Nearby → Chat already "just works" as offline 1:1 — no new screen needed.** Discover's
+Nearby tab already opened the same `Routes.Chat`/`ChatScreen` every other entry point uses;
+the fix was entirely in the data layer above. Tapping a BLE-discovered person now opens a
+thread that actually sends/receives over BLE or Wi-Fi Direct when there's no internet, merging
+with online history by msgId the moment connectivity returns, exactly as asked.
+
+**`AppContainer` wiring:** new `peerKeyResolver`, `offlineMessageStore`,
+`offlineMessageRouter` (`.also { it.start(appScope) }`, mirroring `transportSendCoordinator`).
+`chatRepository`'s constructor changed shape: `(transportSendCoordinator, peerKeyResolver,
+cryptoManager, offlineMessageStore)`, dropping the direct `userRepository`/
+`contactSecurityStore` deps now that `PeerKeyResolver` owns that lookup.
+
+**Not done / left for later:**
+- **Still not run on a real device** — this is new routing/UI layered over transports
+  (BLE/Wi-Fi Direct) that themselves have never run on a device (Sessions 3–7's gap, still
+  open). The two/three-phone `docs/RUNTIME_TEST.md`/`docs/WIFIDIRECT_TEST.md` passes are the
+  actual next step, now also exercising: send a 1:1 message with both phones offline but in
+  BLE/Wi-Fi Direct range, confirm it arrives and the sender's tick flips to "Delivered", then
+  bring both online and confirm the Home/Chat history doesn't duplicate the same message.
+- Delivery-state live-tracking simplification (queued → sent transition can be skipped, see
+  above) — documented, not fixed.
+- No UI surface for *composing* a brand-new offline chat with someone not yet in Discover's
+  Nearby list (unchanged — Nearby/All-Users are still the only entry points into Chat).
+- The buffering indicator counts store-carry-forward entries app-wide, not scoped to the
+  currently-open chat/emergency thread — a queued SOS and a queued chat message both show as
+  one "buffering" count on every screen. Acceptable for this scope; per-chat buffering would
+  need `StoreCarryForwardQueue` to expose counts keyed by `destId`, which it doesn't yet.
 
 ### Session 1 (2026-08-04) — the big rewrite
 XML/Activities → Compose + MVVM; repository layer; DataStore theming; full BLE emergency mesh
@@ -666,6 +784,8 @@ com.capstone.chatapp/
   ui/
     theme/                     # Color.kt, Type.kt, Theme.kt (Material3 light+dark, ThemeMode enum)
     components/                # AppTextField, LoadingButton, AuthScaffold (shared UX)
+                               #   + NEW Session 9: TransportStatusChip, VerifiedBadge (shared
+                               #   across Home/Chat/Emergency and Home/Discover/Chat resp.)
     util/     TimeFormat.kt    # formatTime(Long) / formatTime(Timestamp) for message times
     login/    LoginScreen + LoginViewModel      # also binds+publishes the E2E identity key on sign-in
     signup/   SignupScreen + SignupViewModel    # also binds+publishes the E2E identity key on sign-up
@@ -678,18 +798,27 @@ com.capstone.chatapp/
   data/
     model/        Message.kt, User.kt (+ pubKey), ChatSummary.kt
     local/        EmergencyHistoryStore.kt      # DataStore-persisted SOS history (JSON)
-                   ContactSecurityStore.kt      # NEW Session 5: cached peer pubkeys + verified flags
+                   ContactSecurityStore.kt      # NEW Session 5: cached peer pubkeys + verified
+                                                 #   flags; NEW Session 9: verifiedPeerUids(myUid)
+                                                 #   for list-screen badges
+                   OfflineMessageStore.kt        # NEW Session 9: DataStore-persisted local
+                                                 #   history for 1:1 messages sent/received over
+                                                 #   BLE/Wi-Fi Direct, keyed by chatId
     security/      NEW Session 5 — E2E encryption
       CryptoManager.kt        # X25519 identity (Keystore-wrapped) + HKDF + AES-256-GCM encrypt/decrypt
       SafetyNumber.kt         # order-independent fingerprint of two pubkeys, for manual verification
       QrCodec.kt              # pairing QR payload encode/parse + ZXing bitmap generation
     repository/    AuthRepository, UserRepository (listUsers, pubKey, publishPublicKey),
-                   ChatRepository (observeMessages encrypts/decrypts via CryptoManager +
-                   observeRecentChats + chat-summary upsert; sendMessage NEW Session 8 —
-                   goes through TransportSendCoordinator, returns SendResult instead of
-                   throwing), EmergencyRepository (Firestore `emergencies` read-only as of
-                   Session 8, still plaintext by design — sending moved to the arbiter),
-                   SettingsRepository (DataStore)
+                   PeerKeyResolver (NEW Session 9 — peer-pubkey cache/fetch, shared by
+                   ChatRepository and OfflineMessageRouter),
+                   ChatRepository (observeMessages NEW Session 9 — merges Firestore online
+                   history with OfflineMessageStore by msgId; sendMessage writes an optimistic
+                   local echo then goes through TransportSendCoordinator, returns SendResult
+                   instead of throwing), OfflineMessageRouter (NEW Session 9 — app-scoped;
+                   decrypts targeted packets arriving off BLE/Wi-Fi Direct, persists them,
+                   sends a Packet.ack receipt back), EmergencyRepository (Firestore
+                   `emergencies` read-only as of Session 8, still plaintext by design —
+                   sending moved to the arbiter), SettingsRepository (DataStore)
     transport/
       Tier.kt                 # enum INTERNET / WIFI_DIRECT / BLE_MESH
       Packet.kt               # transport-agnostic wire format: cleartext header + opaque payload
@@ -759,7 +888,10 @@ manual DI via `AppContainer` (no Hilt).
 - [x] E2E encryption for targeted 1:1 messages (X25519 + HKDF + AES-256-GCM) — ⚠ not yet
       compiled/run on a device this session; SOS broadcast stays unencrypted by design
 - [x] QR pairing + safety-number verification for contacts (`ui/pairing/PairingScreen.kt`)
-- [ ] Offline 1:1 over BLE — still doesn't exist; when it lands, CryptoManager already covers it
+- [x] Offline 1:1 over BLE / Wi-Fi Direct (Session 9) — `TransportArbiter` scores all three
+      tiers for a targeted packet now; `OfflineMessageRouter` decrypts/persists/acks packets
+      arriving off BLE/Wi-Fi Direct; `ChatRepository` merges that local history with Firestore
+      by msgId. Nearby → Chat now delivers offline instead of dead-ending. ⚠ not run on a device
 
 **UI / UX (all implemented)**
 - [x] Full Compose + MVVM, single Activity + NavHost
@@ -773,6 +905,11 @@ manual DI via `AppContainer` (no Hilt).
 - [x] Material3 Light/Dark theme; text-field cursor/indicators follow theme
 - [x] Profile screen: change username, theme selector (Light/Dark/System, persisted), logout w/ confirm
 - [x] Elder-friendly: large type scale, big buttons, high contrast
+- [x] Live transport indicator (Internet/Wi-Fi Direct/BLE/buffering) on Home, Chat, Emergency
+      (Session 9) — `ui/components/TransportStatusChip.kt`, one shared source of truth
+- [x] Verified/unverified contact badge on Home, Discover, Chat (Session 9) —
+      `ui/components/VerifiedBadge.kt`
+- [x] Per-message delivery state (Queued/Sent/Delivered) on own chat bubbles (Session 9)
 
 ---
 

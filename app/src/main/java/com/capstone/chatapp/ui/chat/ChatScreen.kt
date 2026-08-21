@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -46,8 +47,11 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
+import com.capstone.chatapp.data.model.DeliveryState
 import com.capstone.chatapp.data.model.Message
 import com.capstone.chatapp.di.appContainer
+import com.capstone.chatapp.ui.components.TransportStatusChip
+import com.capstone.chatapp.ui.components.VerifiedBadge
 import com.capstone.chatapp.ui.util.formatTime
 import com.capstone.chatapp.ui.theme.BubbleReceivedDark
 import com.capstone.chatapp.ui.theme.BubbleReceivedLight
@@ -69,6 +73,8 @@ fun ChatScreen(
                 container.chatRepository,
                 container.authRepository,
                 container.userRepository,
+                container.transportSendCoordinator,
+                container.contactSecurityStore,
                 peerUid,
                 peerName,
             )
@@ -87,13 +93,25 @@ fun ChatScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text(peerName, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                title = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(peerName, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                        Spacer(Modifier.size(6.dp))
+                        VerifiedBadge(verified = state.verified)
+                    }
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                     }
                 },
                 actions = {
+                    TransportStatusChip(
+                        activeTier = state.activeTier,
+                        online = state.activeTier != null,
+                        bufferedCount = state.bufferedCount,
+                        modifier = Modifier.padding(end = 4.dp),
+                    )
                     IconButton(onClick = onVerify) {
                         Icon(Icons.Filled.Lock, contentDescription = "Verify contact / encryption")
                     }
@@ -116,7 +134,7 @@ fun ChatScreen(
                 verticalArrangement = Arrangement.spacedBy(6.dp),
                 contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 12.dp),
             ) {
-                items(state.messages) { message ->
+                items(state.messages, key = { it.msgId.ifBlank { it.hashCode().toString() } }) { message ->
                     MessageBubble(message = message, isMine = message.senderId == vm.currentUid)
                 }
             }
@@ -168,21 +186,28 @@ private fun MessageBubble(message: Message, isMine: Boolean) {
                     style = MaterialTheme.typography.bodyLarge,
                     color = textColor,
                 )
-                val time = formatTime(message.timestamp)
-                if (time.isNotEmpty()) {
-                    Text(
-                        text = time,
-                        style = MaterialTheme.typography.labelSmall,
-                        color = if (isMine) Color.White.copy(alpha = 0.7f)
-                        else MaterialTheme.colorScheme.onSurfaceVariant,
-                        modifier = Modifier
-                            .padding(top = 2.dp)
-                            .align(Alignment.End),
-                    )
+                Row(
+                    modifier = Modifier.padding(top = 2.dp).align(Alignment.End),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    val time = formatTime(message.timestamp)
+                    val tickColor = if (isMine) Color.White.copy(alpha = 0.7f) else MaterialTheme.colorScheme.onSurfaceVariant
+                    if (isMine) {
+                        Text(deliveryLabel(message.state), style = MaterialTheme.typography.labelSmall, color = tickColor)
+                    }
+                    if (time.isNotEmpty()) {
+                        Text(text = time, style = MaterialTheme.typography.labelSmall, color = tickColor)
+                    }
                 }
             }
         }
     }
+}
+
+private fun deliveryLabel(state: DeliveryState): String = when (state) {
+    DeliveryState.QUEUED -> "Queued"
+    DeliveryState.SENT -> "Sent"
+    DeliveryState.DELIVERED -> "Delivered ✓✓"
 }
 
 @Composable

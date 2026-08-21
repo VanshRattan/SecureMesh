@@ -37,4 +37,16 @@ class ContactSecurityStore(private val context: Context) {
 
     fun isVerified(myUid: String, peerUid: String): Flow<Boolean> =
         context.contactSecurityDataStore.data.map { it[verifiedKey(myUid, peerUid)] ?: false }
+
+    /** Every peer uid currently marked verified for [myUid], for list screens (Home, Discover)
+     * that need a verified badge per row without a per-row DataStore subscription each. */
+    fun verifiedPeerUids(myUid: String): Flow<Set<String>> {
+        val prefix = "verified_${myUid}_"
+        return context.contactSecurityDataStore.data.map { prefs ->
+            prefs.asMap().entries
+                .filter { (key, value) -> key.name.startsWith(prefix) && value == true }
+                .map { it.key.name.removePrefix(prefix) }
+                .toSet()
+        }
+    }
 }

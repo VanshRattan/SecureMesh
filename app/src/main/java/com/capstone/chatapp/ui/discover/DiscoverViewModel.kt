@@ -21,6 +21,7 @@ data class DiscoverUiState(
     val nearby: List<NearbyEntry> = emptyList(),
     val neighborCount: Int = 0,
     val meshRunning: Boolean = false,
+    val verifiedUids: Set<String> = emptySet(),
     val errorMessage: String? = null,
 )
 
@@ -40,6 +41,15 @@ class DiscoverViewModel(app: Application) : AndroidViewModel(app) {
     init {
         loadUsers()
         observeNearby()
+        observeVerified()
+    }
+
+    private fun observeVerified() {
+        viewModelScope.launch {
+            container.contactSecurityStore.verifiedPeerUids(myUid).collect { verified ->
+                _state.update { it.copy(verifiedUids = verified) }
+            }
+        }
     }
 
     fun onQueryChange(value: String) = _state.update { it.copy(query = value) }

@@ -3,6 +3,9 @@ package com.capstone.chatapp.data.transport
 import android.util.Base64
 import com.capstone.chatapp.data.local.StoreCarryForwardStore
 import com.capstone.chatapp.data.local.StoredScfEntry
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 
@@ -25,10 +28,17 @@ class StoreCarryForwardQueue(private val store: StoreCarryForwardStore) {
     private val mutex = Mutex()
     private var queue: MutableList<QueuedPacket>? = null // null until first load
 
+    private val _pendingCount = MutableStateFlow(0)
+
+    /** How many packets are currently buffered with no reachable tier -- the status UI's
+     * "buffering" signal. Updated on every enqueue/remove/expiry sweep, not just [pending]. */
+    val pendingCount: StateFlow<Int> = _pendingCount.asStateFlow()
+
     private suspend fun loaded(): MutableList<QueuedPacket> {
         queue?.let { return it }
         val fresh = store.load().mapNotNull { it.toQueuedPacket() }.toMutableList()
         queue = fresh
+        _pendingCount.value = fresh.size
         return fresh
     }
 
@@ -62,6 +72,7 @@ class StoreCarryForwardQueue(private val store: StoreCarryForwardStore) {
     }
 
     private suspend fun persist(q: List<QueuedPacket>) {
+        _pendingCount.value = q.size
         store.save(q.map { it.toStored() })
     }
 

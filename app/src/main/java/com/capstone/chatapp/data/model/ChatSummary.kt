@@ -9,4 +9,7 @@ data class ChatSummary(
     val peerName: String = "",
     val lastMessage: String = "",
     val timestamp: Long = 0L,
+    /** Whether this contact's public key has been confirmed out-of-band (QR pairing or a
+     * matching safety number) -- see `data/local/ContactSecurityStore.kt`. */
+    val verified: Boolean = false,
 )

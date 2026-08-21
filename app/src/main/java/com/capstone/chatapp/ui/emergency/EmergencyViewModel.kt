@@ -50,6 +50,7 @@ data class EmergencyUiState(
     val advertising: Boolean = false,
     val scanning: Boolean = false,
     val activeTier: Tier? = null,
+    val bufferedCount: Int = 0,
     val permissionGranted: Boolean = false,
     val blocker: MeshBlocker = MeshBlocker.NONE,
     val meshError: String? = null,
@@ -106,6 +107,11 @@ class EmergencyViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             container.transportSendCoordinator.activeTier.collect { tier ->
                 _state.update { it.copy(activeTier = tier) }
+            }
+        }
+        viewModelScope.launch {
+            container.transportSendCoordinator.bufferedCount.collect { count ->
+                _state.update { it.copy(bufferedCount = count) }
             }
         }
     }

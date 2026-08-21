@@ -89,6 +89,8 @@ class InternetTransport(private val firestore: FirebaseFirestore = FirebaseFires
             "ciphertext" to Base64.encodeToString(packet.payload, Base64.NO_WRAP),
             "timestamp" to Timestamp.now(),
         )
-        chats.document(chatId).collection("messages").add(data).await()
+        // msgId as the document id (not auto-generated) so ChatRepository can merge this
+        // online copy with any local offline (BLE/Wi-Fi Direct) echo of the same message.
+        chats.document(chatId).collection("messages").document(packet.msgId).set(data).await()
     }
 }

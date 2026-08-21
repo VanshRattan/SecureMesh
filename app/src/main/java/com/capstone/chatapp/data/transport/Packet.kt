@@ -26,6 +26,11 @@ data class Packet(
     val tierTag: Tier,
     val nonce: ByteArray,
     val payload: ByteArray,
+    /** True for a delivery receipt sent back to [srcId] once [destId] has received and
+     * decrypted the original message with this [msgId] -- see `OfflineMessageRouter`. An
+     * ack's own [payload] is empty; it carries no message content, only proof of arrival,
+     * so relaying it blind is harmless from a relay-blindness standpoint. */
+    val ack: Boolean = false,
 ) {
     /** Binary wire format — compact enough to fit BLE's negotiated MTU for typical payloads. */
     fun serialize(): ByteArray {
@@ -44,12 +49,15 @@ data class Packet(
             d.write(nonce)
             d.writeInt(payload.size)
             d.write(payload)
+            d.writeBoolean(ack)
         }
         return out.toByteArray()
     }
 
     companion object {
-        const val CURRENT_VERSION = 1
+        // v2 appended a trailing `ack` byte -- deserialize gates reading it on version so a
+        // v1 stream (none ever shipped, but keeps the format honestly versioned) still parses.
+        const val CURRENT_VERSION = 2
 
         fun deserialize(bytes: ByteArray): Packet? = try {
             DataInputStream(ByteArrayInputStream(bytes)).use { d ->
@@ -62,7 +70,8 @@ data class Packet(
                 val tierTag = Tier.entries.getOrElse(d.readUnsignedByte()) { Tier.BLE_MESH }
                 val nonce = ByteArray(d.readUnsignedShort()).also { d.readFully(it) }
                 val payload = ByteArray(d.readInt()).also { d.readFully(it) }
-                Packet(version, msgId, destId, srcId, ttl, priority, tierTag, nonce, payload)
+                val ack = if (version >= 2) d.readBoolean() else false
+                Packet(version, msgId, destId, srcId, ttl, priority, tierTag, nonce, payload, ack)
             }
         } catch (e: Exception) {
             null

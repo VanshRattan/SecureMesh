@@ -45,6 +45,8 @@ import androidx.lifecycle.viewmodel.initializer
 import androidx.lifecycle.viewmodel.viewModelFactory
 import com.capstone.chatapp.data.model.ChatSummary
 import com.capstone.chatapp.di.appContainer
+import com.capstone.chatapp.ui.components.TransportStatusChip
+import com.capstone.chatapp.ui.components.VerifiedBadge
 import com.capstone.chatapp.ui.util.formatTime
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -57,7 +59,15 @@ fun HomeScreen(
 ) {
     val container = LocalContext.current.appContainer()
     val vm: HomeViewModel = viewModel(factory = viewModelFactory {
-        initializer { HomeViewModel(container.authRepository, container.chatRepository) }
+        initializer {
+            HomeViewModel(
+                container.authRepository,
+                container.chatRepository,
+                container.transportSendCoordinator,
+                container.contactSecurityStore,
+                container.networkMonitor,
+            )
+        }
     })
     val state by vm.state.collectAsStateWithLifecycle()
     val snackbar = remember { SnackbarHostState() }
@@ -71,6 +81,12 @@ fun HomeScreen(
             TopAppBar(
                 title = { Text("Chats") },
                 actions = {
+                    TransportStatusChip(
+                        activeTier = state.activeTier,
+                        online = state.online,
+                        bufferedCount = state.bufferedCount,
+                        modifier = Modifier.padding(end = 4.dp),
+                    )
                     IconButton(onClick = onOpenDiscover) {
                         Icon(Icons.Filled.Search, contentDescription = "Discover people")
                     }
@@ -127,13 +143,16 @@ private fun ChatRow(chat: ChatSummary, onClick: () -> Unit) {
     ) {
         Avatar(name = chat.peerName)
         Column(modifier = Modifier.weight(1f)) {
-            Text(
-                text = chat.peerName,
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = chat.peerName,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                VerifiedBadge(verified = chat.verified)
+            }
             Text(
                 text = chat.lastMessage,
                 style = MaterialTheme.typography.bodyMedium,
