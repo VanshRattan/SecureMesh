@@ -4,6 +4,8 @@ import android.app.Application
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.capstone.chatapp.data.local.StoredSos
+import com.capstone.chatapp.data.transport.SendResult
+import com.capstone.chatapp.data.transport.Tier
 import com.capstone.chatapp.data.transport.ble.BleConstants
 import com.capstone.chatapp.data.transport.ble.BleLog
 import com.capstone.chatapp.data.transport.ble.BleMeshService
@@ -47,6 +49,7 @@ data class EmergencyUiState(
     val bluetoothSupported: Boolean = true,
     val advertising: Boolean = false,
     val scanning: Boolean = false,
+    val activeTier: Tier? = null,
     val permissionGranted: Boolean = false,
     val blocker: MeshBlocker = MeshBlocker.NONE,
     val meshError: String? = null,
@@ -93,6 +96,17 @@ class EmergencyViewModel(app: Application) : AndroidViewModel(app) {
             observeMesh()
             observeInternet()
             observeNetwork()
+            observeActiveTier()
+        }
+    }
+
+    /** Which tier the arbiter would currently use — the status badge's source of truth,
+     * replacing the old plain online/offline flag. */
+    private fun observeActiveTier() {
+        viewModelScope.launch {
+            container.transportSendCoordinator.activeTier.collect { tier ->
+                _state.update { it.copy(activeTier = tier) }
+            }
         }
     }
 
@@ -243,14 +257,12 @@ class EmergencyViewModel(app: Application) : AndroidViewModel(app) {
         // Show it immediately in our own list.
         addItem(packet, mine = true)
 
-        // BLE mesh (works with no internet).
-        mesh.send(packet)
-
-        // Internet path too, when available (same msgId -> receivers de-dup).
-        if (_state.value.online) {
-            viewModelScope.launch {
-                runCatching { container.emergencyRepository.publish(packet) }
-                    .onFailure { BleLog.w(BleLog.Step.SOS_SEND, "path" to "firestore", "error" to it.message) }
+        // The arbiter fans a broadcast out across every reachable tier (internet, Wi-Fi
+        // Direct, BLE mesh) instead of this ViewModel hard-coding which ones to try.
+        viewModelScope.launch {
+            val result = container.transportSendCoordinator.send(packet.toPacket())
+            if (result == SendResult.QUEUED) {
+                BleLog.w(BleLog.Step.SOS_SEND, "path" to "arbiter", "result" to "queued")
             }
         }
     }

@@ -3,18 +3,28 @@ package com.capstone.chatapp.di
 import android.content.Context
 import com.capstone.chatapp.data.local.ContactSecurityStore
 import com.capstone.chatapp.data.local.EmergencyHistoryStore
+import com.capstone.chatapp.data.local.StoreCarryForwardStore
 import com.capstone.chatapp.data.repository.AuthRepository
 import com.capstone.chatapp.data.repository.ChatRepository
 import com.capstone.chatapp.data.repository.EmergencyRepository
 import com.capstone.chatapp.data.repository.SettingsRepository
 import com.capstone.chatapp.data.repository.UserRepository
 import com.capstone.chatapp.data.security.CryptoManager
+import com.capstone.chatapp.data.transport.EnergyMonitor
 import com.capstone.chatapp.data.transport.InternetTransport
 import com.capstone.chatapp.data.transport.NetworkMonitor
+import com.capstone.chatapp.data.transport.StoreCarryForwardQueue
+import com.capstone.chatapp.data.transport.Tier
+import com.capstone.chatapp.data.transport.Transport
+import com.capstone.chatapp.data.transport.TransportArbiter
+import com.capstone.chatapp.data.transport.TransportSendCoordinator
 import com.capstone.chatapp.data.transport.ble.BleMeshManager
 import com.capstone.chatapp.data.transport.ble.BleTransport
 import com.capstone.chatapp.data.transport.wifidirect.WifiDirectManager
 import com.capstone.chatapp.data.transport.wifidirect.WifiDirectTransport
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 
 /**
  * Tiny manual DI container — holds the single instances of each repository and the
@@ -23,6 +33,9 @@ import com.capstone.chatapp.data.transport.wifidirect.WifiDirectTransport
  */
 class AppContainer(context: Context) {
     private val appContext = context.applicationContext
+
+    // Outlives every screen -- backs the arbiter's retry tick + active-tier tracking.
+    private val appScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     val authRepository: AuthRepository = AuthRepository()
     val userRepository: UserRepository = UserRepository()
@@ -44,9 +57,26 @@ class AppContainer(context: Context) {
     val bleTransport: BleTransport = BleTransport(bleMeshManager)
     val wifiDirectTransport: WifiDirectTransport = WifiDirectTransport(wifiDirectManager)
 
+    // Per-hop arbiter + reliable-delivery pipeline: repositories/ViewModels no longer pick a
+    // tier themselves, they hand a Packet to transportSendCoordinator and it decides.
+    val energyMonitor: EnergyMonitor = EnergyMonitor(appContext)
+    val transportArbiter: TransportArbiter =
+        TransportArbiter(bleMeshManager, wifiDirectManager, networkMonitor, energyMonitor)
+    val storeCarryForwardStore: StoreCarryForwardStore = StoreCarryForwardStore(appContext)
+    val storeCarryForwardQueue: StoreCarryForwardQueue = StoreCarryForwardQueue(storeCarryForwardStore)
+    val transportSendCoordinator: TransportSendCoordinator = TransportSendCoordinator(
+        transportArbiter,
+        mapOf<Tier, Transport>(
+            Tier.INTERNET to internetTransport,
+            Tier.WIFI_DIRECT to wifiDirectTransport,
+            Tier.BLE_MESH to bleTransport,
+        ),
+        storeCarryForwardQueue,
+    ).also { it.start(appScope) }
+
     val chatRepository: ChatRepository =
-        ChatRepository(internetTransport, userRepository, cryptoManager, contactSecurityStore)
-    val emergencyRepository: EmergencyRepository = EmergencyRepository(internetTransport)
+        ChatRepository(transportSendCoordinator, userRepository, cryptoManager, contactSecurityStore)
+    val emergencyRepository: EmergencyRepository = EmergencyRepository()
 }
 
 /** Convenience accessor from any Context. */

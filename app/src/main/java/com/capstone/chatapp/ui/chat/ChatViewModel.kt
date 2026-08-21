@@ -6,6 +6,7 @@ import com.capstone.chatapp.data.model.Message
 import com.capstone.chatapp.data.repository.AuthRepository
 import com.capstone.chatapp.data.repository.ChatRepository
 import com.capstone.chatapp.data.repository.UserRepository
+import com.capstone.chatapp.data.transport.SendResult
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -61,7 +62,7 @@ class ChatViewModel(
         _state.update { it.copy(isSending = true) }
         viewModelScope.launch {
             try {
-                chatRepository.sendMessage(
+                val result = chatRepository.sendMessage(
                     chatId = chatId,
                     senderId = currentUid,
                     senderName = myName,
@@ -69,6 +70,11 @@ class ChatViewModel(
                     peerName = peerName,
                     text = trimmed,
                 )
+                if (result == SendResult.QUEUED) {
+                    _state.update {
+                        it.copy(errorMessage = "No connection right now — this message will send automatically")
+                    }
+                }
             } catch (e: Exception) {
                 _state.update { it.copy(errorMessage = "Failed to send message") }
             } finally {

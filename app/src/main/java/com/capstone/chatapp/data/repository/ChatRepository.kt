@@ -5,11 +5,11 @@ import com.capstone.chatapp.data.local.ContactSecurityStore
 import com.capstone.chatapp.data.model.ChatSummary
 import com.capstone.chatapp.data.model.Message
 import com.capstone.chatapp.data.security.CryptoManager
-import com.capstone.chatapp.data.transport.InternetTransport
 import com.capstone.chatapp.data.transport.Packet
 import com.capstone.chatapp.data.transport.Priority
 import com.capstone.chatapp.data.transport.SendResult
 import com.capstone.chatapp.data.transport.Tier
+import com.capstone.chatapp.data.transport.TransportSendCoordinator
 import com.google.firebase.Timestamp
 import com.google.firebase.firestore.FirebaseFirestore
 import com.google.firebase.firestore.Query
@@ -27,17 +27,19 @@ import java.util.UUID
  *
  * Sending encrypts the text with [CryptoManager] (X25519 + HKDF + AES-256-GCM, see that class
  * for the full scheme), wraps the ciphertext as a transport-agnostic [Packet] (destId = peer,
- * srcId = sender) and hands it to [InternetTransport] for the message-doc write; the chat-summary
- * upsert below it is index bookkeeping for the Home list, not part of the wire packet, so it
- * stays a direct Firestore write here. The summary deliberately carries no plaintext preview —
- * see the comment in [sendMessage] — so Firestore never sees 1:1 message content at all.
+ * srcId = sender) and hands it to [TransportSendCoordinator], which asks the per-hop arbiter
+ * which tier to use and falls back to store-carry-forward if none is reachable right now; the
+ * chat-summary upsert below it is index bookkeeping for the Home list, not part of the wire
+ * packet, so it stays a direct Firestore write here. The summary deliberately carries no
+ * plaintext preview — see the comment in [sendMessage] — so Firestore never sees 1:1 message
+ * content at all.
  *
  * Receiving decrypts in [observeMessages], which is the only place a targeted packet's payload
  * is ever opened — relays (Firestore, and later BLE/Wi-Fi-Direct for offline 1:1) never call
  * [CryptoManager.decryptFrom].
  */
 class ChatRepository(
-    private val internetTransport: InternetTransport,
+    private val transportSendCoordinator: TransportSendCoordinator,
     private val userRepository: UserRepository,
     private val cryptoManager: CryptoManager,
     private val contactSecurityStore: ContactSecurityStore,
@@ -92,6 +94,11 @@ class ChatRepository(
         awaitClose { registration.remove() }
     }
 
+    /**
+     * Returns [SendResult.SENT] or [SendResult.QUEUED] — a message that can't reach any tier
+     * right now is queued for store-carry-forward, not a thrown error; the caller should tell
+     * the user it'll go out automatically rather than treating it as a failure.
+     */
     suspend fun sendMessage(
         chatId: String,
         senderId: String,
@@ -99,7 +106,7 @@ class ChatRepository(
         peerId: String,
         peerName: String,
         text: String,
-    ) {
+    ): SendResult {
         val peerPubKey = resolvePeerPublicKey(senderId, peerId)
         val ciphertext = cryptoManager.encryptFor(peerId, peerPubKey, text.toByteArray(Charsets.UTF_8))
 
@@ -113,12 +120,13 @@ class ChatRepository(
             nonce = ByteArray(0), // AesGcmJce bundles its own random IV inside the payload
             payload = ciphertext,
         )
-        val result = internetTransport.sendToNextHop(packet, nextHop = peerId, tier = Tier.INTERNET)
-        check(result == SendResult.SENT) { "Failed to send message" }
+        val result = transportSendCoordinator.send(packet)
 
         // Upsert the parent chat summary so both users can list this thread on Home. No
         // plaintext preview here on purpose: this doc is readable by anyone the Firestore rules
-        // allow, so the "last message" field must stay generic to keep the relay blind.
+        // allow, so the "last message" field must stay generic to keep the relay blind. Upserted
+        // even when queued -- the SCF retry will actually deliver it, this is just the Home
+        // list's index, not a delivery receipt.
         val now = Timestamp.now()
         val summary = hashMapOf(
             "participants" to listOf(senderId, peerId),
@@ -127,6 +135,7 @@ class ChatRepository(
             "lastTimestamp" to now,
         )
         chats.document(chatId).set(summary, SetOptions.merge()).await()
+        return result
     }
 
     /** Realtime list of the current user's conversations, most recent first. */

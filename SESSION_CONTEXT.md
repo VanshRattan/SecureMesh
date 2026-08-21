@@ -1,7 +1,7 @@
 # Session Context — Capstone Emergency Chat App
 
 > Snapshot of the work done across sessions. Read this first to pick up where we left off.
-> Last updated: 2026-08-20 (Session 7)
+> Last updated: 2026-08-21 (Session 8)
 
 ---
 
@@ -266,6 +266,125 @@ see, for a targeted 1:1 message:**
   core:3.5.3`, `androidx.camera:{camera-core,camera-camera2,camera-lifecycle,camera-view}:1.3.1`.
   None of these were previously in the project — first real dependency-resolution risk since the
   original Firebase/Compose BOM setup.
+
+### Session 8 (2026-08-21) — per-hop Transport Arbiter + reliable delivery
+Branch `feat/transport-arbiter`, built on top of `feat/wifi-direct-tier`. Goal: all three
+`Transport` implementations existed (Session 4/7) but nothing chose between them — repositories
+called BLE and Firestore directly, hard-coded. This session adds the per-hop arbiter and a
+store-carry-forward send pipeline so that logic lives in one place. **Compiled and verified this
+session**: `:app:compileDebugKotlin` and `:app:assembleDebug` both succeed (throwaway placeholder
+`google-services.json`, deleted after — same workaround as Sessions 4/6/7). **Not run on a
+device** — this is a pure routing/scoring change over already-existing, already-not-yet-verified
+transports, so it inherits every on-device gap those sessions left (see §8).
+
+**New — `data/transport/TransportArbiter.kt`.** `selectBearer(packet): ArbiterDecision` — either
+`Candidates(orderedList)` or `StoreCarry`. Scores each `Tier` with a weighted sum over four
+factors (`ArbiterWeights`, defaults `reachability=0.45, congestion=0.20, energy=0.15,
+preference=0.20`, all constructor-configurable):
+- **Reachability** — graded, not just on/off: `INTERNET` from `NetworkMonitor.currentlyOnline()`;
+  `WIFI_DIRECT`/`BLE_MESH` score 1.0 with an active peer/socket, a lower 0.5–0.6 if the
+  radio/group is up but nobody's connected yet (still eligible — sending into it still lands in
+  that bearer's own outbox/relay), 0 (excluded outright) if the radio itself isn't up.
+- **Congestion** — rough proxy from each bearer's own concurrency ceiling (`neighborCount` vs.
+  `BleConstants.MAX_CONCURRENT_GATT_CONNECTIONS`, `connectedSockets` vs. a soft cap for Wi-Fi
+  Direct); `INTERNET` has no client-visible signal so it's always 1.0. Documented as deliberately
+  coarse — neither bearer exposes real queue-depth telemetry.
+- **Energy** — new `data/transport/EnergyMonitor.kt` (plain `BatteryManager` reads, no
+  permission needed). Charging → energy stops mattering (1.0 everywhere). On battery,
+  `WIFI_DIRECT` falls off hardest (`battery²`), `BLE_MESH` more gently, `INTERNET` not at all
+  (marginal cost of reusing an already-open data connection is treated as negligible).
+- **Priority** — `EMERGENCY` packets fold the congestion+energy weight into reachability instead
+  (`effectiveWeights`): an SOS shouldn't be held back by efficiency concerns, it should just chase
+  whatever path is most likely to deliver.
+- **Preference** — the default tie-breaker/base ranking, `INTERNET(1.0) > WIFI_DIRECT(0.6) >
+  BLE_MESH(0.3)`, per the task's required default order; also a constructor param.
+
+**Targeted (1:1) packets are hard-restricted to `Tier.INTERNET`** in `selectBearer` — BLE/Wi-Fi
+Direct can carry the ciphertext bytes today, but nothing on the receiving side consumes a
+*targeted* packet off either transport (`ChatRepository.observeMessages` only ever listens to
+Firestore). Recommending them would report `SENT` for a message the recipient's app can never
+actually surface, so this is a deliberate, documented restriction (`TODO(offline 1:1)` in the
+arbiter) rather than a silent gap — real offline 1:1 delivery still doesn't exist, unchanged from
+every prior session's gap list. Broadcasts (SOS, `destId == null`) have no such restriction.
+
+**New — `data/transport/TransportSendCoordinator.kt`.** The one send pipeline everything now goes
+through: `send(packet): SendResult` (always `SENT` or `QUEUED`, never throws/`FAILED` to the
+caller). Targeted packets try candidates **in order**, stopping at the first `SENT` — one intended
+recipient, no reason to also try a worse tier. Broadcasts are **fanned out to every reachable
+candidate** rather than stopping at the first — each bearer physically reaches a different
+audience, so this preserves (and extends to three tiers) the pre-arbiter behaviour of always
+dual-sending an SOS over BLE + Firestore. On total failure, enqueues into
+`StoreCarryForwardQueue`. Exposes `activeTier: StateFlow<Tier?>` — updated on every successful send
+and on every arbiter-availability change — as the new single source of truth for "which tier is
+this app actually using right now," replacing the old plain online/offline boolean.
+
+**New — `data/transport/StoreCarryForwardQueue.kt` + `data/local/StoreCarryForwardStore.kt`.**
+Persisted (DataStore, JSON, same pattern as `EmergencyHistoryStore`/`ContactSecurityStore`) queue
+of packets that failed on every currently-reachable tier, keyed by `msgId` (a re-enqueue of the
+same message replaces the stale copy rather than duplicating). Expiry: 15 min for `NORMAL`
+priority, 6 h for `EMERGENCY` (a stranded SOS is worth holding much longer than a stranded chat
+message) — `pending()` drops anything past its deadline before returning. Packets are stored as
+their own `Packet.serialize()` bytes (base64), so replaying one is just re-running
+`TransportSendCoordinator`'s existing send logic against the same opaque bytes — **handover never
+re-encrypts**, satisfying that constraint by construction rather than needing special-cased logic.
+
+**Retry tick.** `TransportSendCoordinator.start(scope)` (called once from `AppContainer` with a
+new app-lifetime `appScope`) collects `TransportArbiter.availabilityChanges` — a merge of
+`NetworkMonitor.isOnline`, `BleMeshManager.status`, `WifiDirectManager.status` — and on every
+change re-attempts every queued packet, removing each one that finally sends. This is
+event-driven (fires when a bearer's status actually changes), not a fixed-interval poll.
+
+**Repositories/ViewModels now route through the coordinator instead of picking a tier
+themselves:**
+- `EmergencyViewModel.sendSos` no longer calls `mesh.send()` directly or conditionally calls
+  `EmergencyRepository.publish()` — it builds the same `BlePacket`/`Packet` as before and calls
+  `container.transportSendCoordinator.send(packet.toPacket())` once. `EmergencyRepository.publish`
+  was deleted (dead code once nothing called it); `EmergencyRepository` is now read-only
+  (`observeEmergencies`) and its `InternetTransport` constructor param is gone.
+- `ChatRepository.sendMessage` now takes a `TransportSendCoordinator` instead of an
+  `InternetTransport`, calls `coordinator.send(packet)`, and **returns `SendResult`** instead of
+  throwing on failure — a `QUEUED` result is not an error. `ChatViewModel.sendMessage` shows a
+  neutral "will send automatically" notice for `QUEUED` instead of "Failed to send message".
+- The chat-summary Firestore upsert in `sendMessage` is unconditional (even on `QUEUED`) since it
+  was already only ever index bookkeeping for Home's list, not a delivery receipt.
+
+**`AppContainer` wiring:** new `appScope` (`SupervisorJob + Dispatchers.Default`, outlives every
+screen); `energyMonitor`, `transportArbiter`, `storeCarryForwardStore`, `storeCarryForwardQueue`,
+`transportSendCoordinator` (constructed with a `Map<Tier, Transport>` of the three existing
+transports, `.also { it.start(appScope) }`). `chatRepository` now takes `transportSendCoordinator`;
+`emergencyRepository` takes no transport at all now.
+
+**Status UI updated to reflect the active tier** (the task's explicit ask) — `EmergencyUiState`
+gained `activeTier: Tier?`, populated by a new `EmergencyViewModel.observeActiveTier()` collecting
+`transportSendCoordinator.activeTier`. `EmergencyScreen`'s `StatusBadge` now reads `"Internet"` /
+`"Wi-Fi Direct"` / `"Offline · BLE"` from `activeTier` (falling back to the old online/offline
+boolean only for the brief window before the first arbiter reading arrives) instead of a flat
+online/offline flag. `InfoBanner`'s copy was intentionally left alone — it's already keyed off
+`meshRunning`/`neighborCount`/`online` directly for BLE-specific troubleshooting detail that
+`activeTier` alone doesn't carry (advertising vs. scanning vs. blocked-by-permissions), and
+touching it wasn't asked for.
+
+**TODO seam for the model-based arbiter (as scoped: rule-based now).** `TransportArbiter`'s
+`scoreTier` carries a `TODO(ml-arbiter)` doc comment marking where a small on-device TF-Lite model
+— trained on real `(reachability, congestion, energy, priority) -> outcome` samples once the
+evaluation instrumentation from CLAUDE.md §5.5 exists — would plug in, without needing
+`selectBearer`'s signature or `ArbiterDecision`'s shape to change.
+
+**Not done / left for later:**
+- **No offline 1:1 over BLE/Wi-Fi Direct still** — the arbiter's hard restriction (targeted
+  packets → `Tier.INTERNET` only) makes this explicit and enforced rather than an accidental gap,
+  but building the actual receive-side wiring (`ChatRepository` consuming `bleTransport.incoming`/
+  `wifiDirectTransport.incoming` for targeted packets) is still future work.
+- **Congestion scoring is a rough proxy** (concurrency-cap-relative, not real queue depth) — flagged
+  in the arbiter's own doc comments; would need each manager to expose an actual pending-job count
+  to do better.
+- **Not run on a device.** Everything here is new routing/scoring logic layered over transports
+  that themselves have never run on a device (Sessions 4–7's gap, still open) — see §8.
+- **No evaluation instrumentation yet** (delivery ratio, latency, hop count, per-tier usage,
+  battery — CLAUDE.md §5.5) — the arbiter's own decisions aren't logged anywhere yet beyond the
+  existing `BleLog`/`WifiDirectLog` per-bearer traces plus one `SOS_SEND | path=arbiter |
+  result=queued` line; a real evaluation pass would want the arbiter's own scores/decisions logged
+  per send, not just the outcome.
 
 ### Session 7 (2026-08-20) — Wi-Fi Direct tier (the missing middle transport)
 Branch `feat/wifi-direct-tier`, built on top of `feat/mesh-hardening`. Goal: implement the
@@ -565,16 +684,29 @@ com.capstone.chatapp/
       SafetyNumber.kt         # order-independent fingerprint of two pubkeys, for manual verification
       QrCodec.kt              # pairing QR payload encode/parse + ZXing bitmap generation
     repository/    AuthRepository, UserRepository (listUsers, pubKey, publishPublicKey),
-                   ChatRepository (observeMessages now encrypts/decrypts via CryptoManager +
-                   observeRecentChats + chat-summary upsert), EmergencyRepository (Firestore
-                   `emergencies`, still plaintext by design), SettingsRepository (DataStore)
+                   ChatRepository (observeMessages encrypts/decrypts via CryptoManager +
+                   observeRecentChats + chat-summary upsert; sendMessage NEW Session 8 —
+                   goes through TransportSendCoordinator, returns SendResult instead of
+                   throwing), EmergencyRepository (Firestore `emergencies` read-only as of
+                   Session 8, still plaintext by design — sending moved to the arbiter),
+                   SettingsRepository (DataStore)
     transport/
       Tier.kt                 # enum INTERNET / WIFI_DIRECT / BLE_MESH
       Packet.kt               # transport-agnostic wire format: cleartext header + opaque payload
       Transport.kt            # interface every bearer implements + SendResult enum
       InternetTransport.kt    # Transport over Firestore (emergencies plaintext, chats/{chatId}/messages ciphertext)
-      WifiDirectTransport.kt  # TODO(Session 6) stub — always UNAVAILABLE
       NetworkMonitor.kt        # validated-internet flow (online/offline)
+      EnergyMonitor.kt         # NEW Session 8 — BatteryManager fraction/charging read, no permission needed
+      TransportArbiter.kt      # NEW Session 8 — selectBearer(packet): weighted score over
+                               #   reachability/congestion/energy/priority per Tier; ArbiterDecision
+                               #   (Candidates, ordered) | StoreCarry; targeted (1:1) packets hard-
+                               #   restricted to INTERNET (no offline-1:1 receive-side wiring yet)
+      TransportSendCoordinator.kt # NEW Session 8 — the one send pipeline: ordered try for targeted,
+                               #   fan-out-to-all for broadcasts, SCF enqueue on total failure,
+                               #   retry tick on arbiter.availabilityChanges, activeTier StateFlow
+      StoreCarryForwardQueue.kt   # NEW Session 8 — persisted (via data/local/StoreCarryForwardStore.kt)
+                               #   queue of packets with no reachable tier; TTL 15min normal / 6h emergency
+      wifidirect/              # peer discovery + group formation + socket relay (Session 7) — see below
       ble/
         BleConstants.kt        # UUIDs, TTL=10, REACH_CAP=100, MTU=185, timeouts/eviction/outbox windows
                                #   + NEW Session 6: concurrency cap, retry/backoff, seen TTL, jitter,
@@ -593,6 +725,10 @@ com.capstone.chatapp/
                                #   scan/advertise duty-cycling — all Session 6
         BleMeshService.kt      # foreground service (type connectedDevice) keeping mesh alive
         BlePermissions.kt      # runtime perms per SDK level; essential vs optional; location-toggle check
+      wifidirect/              # Session 7 — peer discovery, one-group formation, socket relay
+        WifiDirectManager.kt   # discoverPeers/connect, GO ServerSocket + client socket, status/incoming
+        WifiDirectTransport.kt # Transport wrapping WifiDirectManager (star fan-out, nextHop ignored)
+        WifiDirectFrame.kt, WifiDirectPermissions.kt, WifiDirectConstants.kt, WifiDirectLog.kt, WifiDirectPeer.kt
 ```
 
 **Patterns:** one `ViewModel` per screen (state as `StateFlow`, survives rotation);
@@ -613,7 +749,13 @@ manual DI via `AppContainer` (no Hilt).
 - [x] SOS restyled as a chat (bubbles, newest-at-bottom, timestamps) + history persisted across restarts
 - [x] Multi-hop relay (flood + seen-set), shortest-path-wins, ~100 reach cap + 10-hop TTL
 - [x] Dual-send when online (BLE + Firestore `emergencies`), de-dup by `msgId`
-- [x] Online / Offline·BLE status badge + nearby-device count
+- [x] Per-hop Transport Arbiter (`TransportArbiter` + `TransportSendCoordinator`, Session 8) —
+      replaces the ad-hoc BLE-plus-Firestore dual-send; broadcasts fan out across every reachable
+      tier, targeted 1:1 sends are ordered/restricted to Internet, failed sends persist to a
+      store-carry-forward queue and retry automatically — ⚠ new routing over transports that
+      themselves are still not run on a device
+- [x] Status badge shows the active tier (Internet / Wi-Fi Direct / Offline·BLE), not just a flat
+      online/offline flag — nearby-device count unchanged
 - [x] E2E encryption for targeted 1:1 messages (X25519 + HKDF + AES-256-GCM) — ⚠ not yet
       compiled/run on a device this session; SOS broadcast stays unencrypted by design
 - [x] QR pairing + safety-number verification for contacts (`ui/pairing/PairingScreen.kt`)
